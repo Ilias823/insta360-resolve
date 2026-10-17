@@ -206,7 +206,7 @@ def adjusted_raw(raw, x):
     return "_".join(values)
 
 
-def apply_refinement(info, x, before, after, frames):
+def apply_refinement(info, x, before, after, frames, force=False):
     """Stores a seam fit (lens B yaw, pitch, cx, cy) in a clip's info, keeping the factory values.
 
     A fit that does not explain the misalignment well leaves the calibration unchanged.
@@ -214,7 +214,7 @@ def apply_refinement(info, x, before, after, frames):
     """
     factory_raw = info.get("calibration_factory", info["calibration_raw"])
     factory_lenses = info.get("lenses_factory", info["lenses"])
-    applied = after <= 0.5 * before
+    applied = force or after <= 0.5 * before
     info["calibration_factory"] = factory_raw
     info["lenses_factory"] = factory_lenses
     info["calibration_raw"] = adjusted_raw(factory_raw, x) if applied else factory_raw
@@ -284,17 +284,80 @@ def measure_seam(lens_a, lens_b, factory_raw, frames=REFINE_FRAMES, helper=None,
     return json.loads(out)
 
 
+# The lens-B correction is the same for every clip of a camera, so good measurements are kept
+# per camera: clips whose seam shows too little detail to measure (dark scenes, plain walls)
+# borrow them. The latest import's calibration is also where the plugin looks by default.
+SUPPORT_DIR = Path.home() / "Library/Application Support/Insta360Stitch"
+DEFAULT_CALIBRATION = SUPPORT_DIR / "default-calibration.json"   # read by the plugin (Calibration.cpp)
+MAX_REMEMBERED_FITS = 20
+
+
+def camera_profile_path(serial):
+    return SUPPORT_DIR / "cameras" / f"{serial or 'unknown'}.json"
+
+
+def camera_refinement(serial):
+    """Median of this camera's good seam fits as [yaw, pitch, cx, cy], or None."""
+    try:
+        fits = json.loads(camera_profile_path(serial).read_text())["fits"]
+    except (OSError, ValueError, KeyError):
+        return None
+    if not fits:
+        return None
+    return [sorted(f[i] for f in fits)[len(fits) // 2] for i in range(4)]
+
+
+def remember_fit(serial, x):
+    path = camera_profile_path(serial)
+    try:
+        fits = json.loads(path.read_text())["fits"]
+    except (OSError, ValueError, KeyError):
+        fits = []
+    fits = (fits + [[float(v) for v in x]])[-MAX_REMEMBERED_FITS:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"serial": serial, "fits": fits}, indent=2))
+
+
+def write_default_calibration(info):
+    """Makes this clip's calibration the plugin's default (used when its Calibration File is empty)."""
+    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_CALIBRATION.write_text(json.dumps({"calibration_raw": info["calibration_raw"],
+                                               "serial": info.get("serial", ""), "clip": info.get("source", "")}))
+
+
+def borrow_camera_refinement(path):
+    """Gives a clip whose seam could not be measured its camera's remembered correction.
+
+    Returns True if it did.
+    """
+    info = json.loads(path.read_text())
+    x = camera_refinement(info.get("serial"))
+    if x is None or info.get("seam_refinement", {}).get("applied"):
+        return False
+    before, after = info.get("seam_refinement", {}).get("misalignment_px", [0.0, 0.0])
+    apply_refinement(info, x, before, after, 0, force=True)
+    info["seam_refinement"]["from_camera"] = True
+    path.write_text(json.dumps(info, indent=2))
+    write_default_calibration(info)
+    return True
+
+
 def refine(path, lens_a, lens_b, report=lambda fraction: None):
-    """Measures and stores the seam refinement in the clip's .json; returns a message."""
+    """Measures and stores the seam refinement in the clip's .json; returns a short note."""
     info = json.loads(path.read_text())
     fit = measure_seam(lens_a, lens_b, info.get("calibration_factory", info["calibration_raw"]), report=report)
     x = [fit["yaw"], fit["pitch"], fit["cx"], fit["cy"]]
     before, after = fit["misalignment_px"]
     applied = apply_refinement(info, x, before, after, fit["frames"])
     path.write_text(json.dumps(info, indent=2))
-    if not applied:
-        return f"seam calibration left unchanged (fit {before:.1f} -> {after:.1f} px)"
-    return f"seam calibration refined, {before:.1f} -> {after:.1f} px"
+    if applied:
+        remember_fit(info.get("serial"), x)
+        write_default_calibration(info)
+        return "lenses lined up"
+    if borrow_camera_refinement(path):
+        return "lenses lined up using this camera's other clips"
+    write_default_calibration(info)
+    return "factory lens alignment (the seam was too dark or plain to measure)"
 
 
 def refine_existing(paths):
@@ -470,6 +533,17 @@ def main():
             rows.append(["FAILED", results[-1]])
             print(results[-1], file=sys.stderr)
     progress.close()
+
+    # Clips measured before a later clip of the same camera gave a good fit get it now.
+    for row in rows:
+        if row[0] != "FAILED" and row[6].startswith("factory lens alignment"):
+            json_path = Path(row[1]).with_name(f"{row[0]}.json")
+            try:
+                if borrow_camera_refinement(json_path):
+                    row[6] = "lenses lined up using this camera's other clips"
+            except (OSError, ValueError, KeyError):
+                pass
+
     if args.report:
         args.report.write_text("".join("\t".join(c.replace("\t", " ").replace("\n", " ") for c in r) + "\n" for r in rows))
     if args.notify:

@@ -79,7 +79,7 @@ def proto_fields(buf):
             return
 
 
-CAMERA_FIELD, FIRMWARE_FIELD = 2, 3
+SERIAL_FIELD, CAMERA_FIELD, FIRMWARE_FIELD = 1, 2, 3
 CALIB_FIELD = 111   # extended calibration string: a count, then 27 values per lens
 SENSOR_W = 5376     # calibration is expressed on a 2 x 5376 wide sensor canvas
 
@@ -99,7 +99,8 @@ def read_summary(path):
             "yaw": vals[s + 5], "pitch": vals[s + 6], "roll": vals[s + 7],
             "t": vals[s + 8:s + 11], "d": vals[s + 11:s + 24],
         })
-    return {"camera": fields.get(CAMERA_FIELD, b"").decode(),
+    return {"serial": fields.get(SERIAL_FIELD, b"").decode(),
+            "camera": fields.get(CAMERA_FIELD, b"").decode(),
             "firmware": fields.get(FIRMWARE_FIELD, b"").decode(),
             "has_gyro": 3 in recs, "sensor_width": SENSOR_W,
             "calibration_raw": text, "lenses": lenses}

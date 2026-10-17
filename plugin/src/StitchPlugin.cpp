@@ -12,6 +12,7 @@
 #include <mutex>
 #include <atomic>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <chrono>
 #include <set>
@@ -256,6 +257,37 @@ StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
     m_BaseDistance = fetchDoubleParam(kParamBaseDistance);
 }
 
+// ~/Library/Application Support/Insta360Stitch/default-calibration.json, written by tools/ingest.py.
+// Read again only when the file changes, since this runs for every frame.
+static bool DefaultCalibration(std::string& p_Raw)
+{
+    static std::mutex mutex;
+    static std::string cached;
+    static struct timespec cachedTime = {0, 0};
+
+    const char* home = getenv("HOME");
+    const std::string path = std::string(home ? home : "") + "/Library/Application Support/Insta360Stitch/default-calibration.json";
+    struct stat info;
+    if (!home || stat(path.c_str(), &info) != 0)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (info.st_mtimespec.tv_sec != cachedTime.tv_sec || info.st_mtimespec.tv_nsec != cachedTime.tv_nsec)
+    {
+        std::string raw;
+        cached = ReadCalibrationFile(path, raw) ? raw : "";
+        cachedTime = info.st_mtimespec;
+    }
+    if (cached.empty())
+    {
+        return false;
+    }
+    p_Raw = cached;
+    return true;
+}
+
 void StitchPlugin::loadCalibration(double p_Time, LensCalibration p_Lenses[2])
 {
     std::string calibrationPath;
@@ -263,7 +295,17 @@ void StitchPlugin::loadCalibration(double p_Time, LensCalibration p_Lenses[2])
     std::string raw = kNominalX5Calibration;
     if (calibrationPath.empty())
     {
-        LogOnce("no calibration file set; using the built-in X5 values");
+        // The import tool leaves the latest imported clip's calibration here; cameras differ, so
+        // that is a better default than the built-in values (which come from one particular X5).
+        if (DefaultCalibration(raw))
+        {
+            LogOnce("no calibration file set; using the last imported camera's calibration");
+        }
+        else
+        {
+            raw = kNominalX5Calibration;
+            LogOnce("no calibration file set; using the built-in X5 values");
+        }
     }
     else if (!ReadCalibrationFile(calibrationPath, raw))
     {
@@ -515,6 +557,10 @@ void StitchPlugin::checkForUpdates()
     }
 
     std::string notes = release.notes.substr(0, 400);
+    for (char& c : notes)
+    {
+        c = c == '<' ? '(' : c == '>' ? ')' : c;
+    }
     if (release.notes.size() > 400)
     {
         notes += "...";
@@ -1227,7 +1273,8 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
 
     OFX::StringParamDescriptor* calibration = p_Desc.defineStringParam(kParamCalibration);
     calibration->setLabels("Calibration File", "Calibration File", "Calibration File");
-    calibration->setHint("The .json file the ingest script wrote next to the lens files. Leave empty to use built-in X5 values.");
+    calibration->setHint("The .json file the import wrote next to a clip's lens files. Leave empty to use the calibration of the "
+                         "camera you imported from last, which is right unless you edit clips from several cameras.");
     calibration->setStringType(OFX::eStringTypeFilePath);
     calibration->setFilePathExists(true);
     calibration->setAnimates(false);
