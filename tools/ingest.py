@@ -31,6 +31,7 @@ from insv_trailer import read_summary
 RESOLVE_API = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
 RESOLVE_LIB = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
 BIN_NAME = "Insta360"
+SOURCE_BIN_NAME = "Source files"   # inside BIN_NAME, for the lens files
 # Helper programs inside the plugin bundle: the development build first, then the installed one.
 BUNDLE_RESOURCES = "Insta360Stitch.ofx.bundle/Contents/Resources"
 BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build", Path("/Library/OFX/Plugins")]
@@ -381,6 +382,12 @@ def build(project, lens_a, lens_b, info, name):
     compound = timeline.CreateCompoundClip([item_a, item_b], {"name": compound_name})
     if compound is None:
         raise RuntimeError(f"{name}: could not create compound clip")
+    # As the Scripts-menu entry does: the working timeline goes (the compound clip keeps its own
+    # copy) and the lens files move into a sub-bin, so the bin shows only the "<name> 360" clips.
+    pool.DeleteTimelines([timeline])
+    sources = next((f for f in folder.GetSubFolderList() or [] if f.GetName() == SOURCE_BIN_NAME), None)
+    pool.MoveClips([a, b], sources or pool.AddSubFolder(folder, SOURCE_BIN_NAME))
+    pool.SetCurrentFolder(folder)
     return f"'{compound_name}' created, {width}x{height} @ {info['fps']}{warning}"
 
 

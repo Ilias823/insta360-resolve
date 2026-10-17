@@ -52,6 +52,8 @@
 #define kParamTrackLength "trackLength"
 #define kParamTrackToEnd "trackToEnd"
 #define kParamShowBox "showSubjectBox"
+#define kParamNoDistortion "removeDistortion"
+#define kDewarpMaxFov 100.0 // widest view a straight-line lens shows without stretching (Insta360's Dewarp stops there too)
 #define kParamAbout "about"
 #define kParamDonate "donate"
 #define kDonateUrl "https://ko-fi.com/ilias823"
@@ -182,6 +184,17 @@ private:
     void applyStyle(int p_Style);
     void loadCalibration(double p_Time, LensCalibration p_Lenses[2]);
     void trackSubject(double p_Time);
+    // Field of view and distance actually used: Remove Distortion turns the lens straight.
+    void viewLens(double p_Time, double& p_Fov, double& p_Distance) const
+    {
+        p_Fov = m_Fov->getValueAtTime(p_Time);
+        p_Distance = m_Distance->getValueAtTime(p_Time);
+        if (m_NoDistortion->getValueAtTime(p_Time))
+        {
+            p_Fov = fmin(p_Fov, kDewarpMaxFov);
+            p_Distance = 0.0;
+        }
+    }
     void checkForUpdates();
     int matchingStyle(double p_Time) const;
 
@@ -207,6 +220,7 @@ private:
     OFX::DoubleParam* m_TrackLength;
     OFX::BooleanParam* m_TrackToEnd;
     OFX::BooleanParam* m_ShowBox;
+    OFX::BooleanParam* m_NoDistortion;
     OFX::DoubleParam* m_BoxX;
     OFX::DoubleParam* m_BoxY;
     OFX::DoubleParam* m_BaseDistance;
@@ -235,6 +249,7 @@ StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
     m_TrackLength = fetchDoubleParam(kParamTrackLength);
     m_TrackToEnd = fetchBooleanParam(kParamTrackToEnd);
     m_ShowBox = fetchBooleanParam(kParamShowBox);
+    m_NoDistortion = fetchBooleanParam(kParamNoDistortion);
     m_TrackLength->setEnabled(!m_TrackToEnd->getValue());
     m_BoxX = fetchDoubleParam(kParamBoxX);
     m_BoxY = fetchDoubleParam(kParamBoxY);
@@ -286,9 +301,10 @@ void StitchPlugin::trackSubject(double p_Time)
     const OfxRectD rod = m_SrcClip->getRegionOfDefinition(p_Time);
     const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
     StitchParams view = {};
-    const double fov = m_Fov->getValueAtTime(p_Time);
+    double fov, distance;
+    viewLens(p_Time, fov, distance);
     const double camPan = m_Pan->getValueAtTime(p_Time), camTilt = m_Tilt->getValueAtTime(p_Time);
-    FillViewParams(camPan, camTilt, m_Roll->getValueAtTime(p_Time), fov, m_Distance->getValueAtTime(p_Time),
+    FillViewParams(camPan, camTilt, m_Roll->getValueAtTime(p_Time), fov, distance,
                    (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : 16.0 / 9.0, view);
     double ray[3];
     ViewPointToRay(view, m_BoxX->getValueAtTime(p_Time), 1.0 - m_BoxY->getValueAtTime(p_Time), ray);
@@ -693,8 +709,10 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         // The buffer can be squeezed (thumbnails are), so the shape of the view comes from the clip.
         const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
         const double aspect = (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : double(params.width) / params.height;
+        double fov, distance;
+        viewLens(p_Args.time, fov, distance);
         FillViewParams(m_Pan->getValueAtTime(p_Args.time), m_Tilt->getValueAtTime(p_Args.time), m_Roll->getValueAtTime(p_Args.time),
-                       m_Fov->getValueAtTime(p_Args.time), m_Distance->getValueAtTime(p_Args.time), aspect, params);
+                       fov, distance, aspect, params);
     }
     params.blendBand = float(sin(m_BlendWidth->getValueAtTime(p_Args.time) * 0.5 * M_PI / 180.0));
     params.gainMatch = m_GainMatch->getValueAtTime(p_Args.time) ? 1 : 0;
@@ -734,6 +752,7 @@ public:
         m_Distance = p_Effect->fetchDoubleParam(kParamDistance);
         m_SubjectSize = p_Effect->fetchDoubleParam(kParamSubjectSize);
         m_ShowBox = p_Effect->fetchBooleanParam(kParamShowBox);
+        m_NoDistortion = p_Effect->fetchBooleanParam(kParamNoDistortion);
         m_BoxX = p_Effect->fetchDoubleParam(kParamBoxX);
         m_BoxY = p_Effect->fetchDoubleParam(kParamBoxY);
         m_Effect = p_Effect;
@@ -764,9 +783,11 @@ private:
         return view >= 0 && view < 4 && kViewModes[view] == eModeReframe;
     }
 
-    double maxFov(double /*p_Time*/) const
+    double maxFov(double p_Time) const
     {
-        return 340.0; // wide views curve automatically (AutoDistance), so every angle is usable
+        // Wide views curve automatically (AutoDistance), so every angle is usable, unless the
+        // lens is kept straight.
+        return m_NoDistortion->getValueAtTime(p_Time) ? kDewarpMaxFov : 340.0;
     }
 
     Layout layout(double p_Time, const OfxPointD& p_PixelScale) const
@@ -813,6 +834,7 @@ private:
     OFX::DoubleParam* m_Distance;
     OFX::DoubleParam* m_SubjectSize;
     OFX::BooleanParam* m_ShowBox;
+    OFX::BooleanParam* m_NoDistortion;
     OFX::DoubleParam* m_BoxX;
     OFX::DoubleParam* m_BoxY;
     Drag m_Drag;
@@ -1046,6 +1068,10 @@ void StitchPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
     p_Desc.setNoSpatialAwareness(false);
 
     p_Desc.setOverlayInteractDescriptor(new ReframeInteractDescriptor());
+
+    // Icon for hosts that show one: files in the bundle's Resources, vector first.
+    p_Desc.getPropertySet().propSetString(kOfxPropIcon, kPluginIdentifier ".svg", 0, false);
+    p_Desc.getPropertySet().propSetString(kOfxPropIcon, kPluginIdentifier ".png", 1, false);
 }
 
 void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, OFX::ContextEnum /*p_Context*/)
@@ -1110,6 +1136,15 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
         param->setParent(*reframe);
         page->addChild(*param);
     }
+
+    OFX::BooleanParamDescriptor* noDistortion = p_Desc.defineBooleanParam(kParamNoDistortion);
+    noDistortion->setLabels("Remove Distortion", "Remove Distortion", "Remove Distortion");
+    noDistortion->setHint("Keeps straight lines straight, like Insta360's Dewarp / linear view: the curve is taken out "
+                          "and the view is limited to 100 degrees so the edges do not stretch. Turn off to get your "
+                          "Field of View and Distance back.");
+    noDistortion->setDefault(false);
+    noDistortion->setParent(*reframe);
+    page->addChild(*noDistortion);
 
     OFX::GroupParamDescriptor* tracking = p_Desc.defineGroupParam("tracking");
     tracking->setLabels("Subject Tracking", "Subject Tracking", "Subject Tracking");

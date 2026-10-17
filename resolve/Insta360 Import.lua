@@ -9,6 +9,7 @@
 -- setting is needed. @INGEST@ is filled in when the script is installed.
 local INGEST = "@INGEST@"
 local BIN_NAME = "Insta360"
+local SOURCE_BIN_NAME = "Source files"   -- inside BIN_NAME: the lens files the 360 clips are made from
 local PYTHONS = {
     "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython",
     "/opt/homebrew/bin/python3",
@@ -120,6 +121,26 @@ for _, sub in ipairs(pool:GetRootFolder():GetSubFolderList() or {}) do
     end
 end
 folder = folder or pool:AddSubFolder(pool:GetRootFolder(), BIN_NAME)
+
+-- The bin shows only the "<name> 360" clips people edit with; the lens files they are made
+-- from go into a sub-bin. Lens files left in the bin by earlier imports are tidied away too.
+local sourceFolder
+for _, sub in ipairs(folder:GetSubFolderList() or {}) do
+    if sub:GetName() == SOURCE_BIN_NAME then
+        sourceFolder = sub
+    end
+end
+sourceFolder = sourceFolder or pool:AddSubFolder(folder, SOURCE_BIN_NAME)
+local stray = {}
+for _, item in ipairs(folder:GetClipList() or {}) do
+    local name = item:GetName() or ""
+    if name:match("_lens[AB]%.mov$") then
+        table.insert(stray, item)
+    end
+end
+if #stray > 0 then
+    pool:MoveClips(stray, sourceFolder)
+end
 pool:SetCurrentFolder(folder)
 
 local function basename(path)
@@ -179,6 +200,11 @@ local function build(clip)
     if not timeline:CreateCompoundClip({itemA, itemB}, {name = compoundName}) then
         return "FAILED: could not create the compound clip"
     end
+    -- The working timeline is not needed once the compound clip exists (it keeps its own copy),
+    -- and the lens files go out of sight into the sub-bin.
+    pool:DeleteTimelines({timeline})
+    pool:MoveClips({a, b}, sourceFolder)
+    pool:SetCurrentFolder(folder)
     return "ready"
 end
 
@@ -193,7 +219,8 @@ for _, clip in ipairs(clips) do
 end
 if imported > 0 then
     table.insert(messages, "")
-    table.insert(messages, "The clips are in the '" .. BIN_NAME .. "' bin as '<name> 360'. Add the Insta360 Stitch effect to use them.")
+    table.insert(messages, "Use the '<name> 360' clips in the '" .. BIN_NAME .. "' bin: put one on a timeline and add the Insta360 Stitch effect. "
+        .. "(The lens files they are made from are in '" .. SOURCE_BIN_NAME .. "'; leave them there.)")
 end
 print("Insta360 Import:\n" .. table.concat(messages, "\n"))
 dialog(table.concat(messages, "\n"))

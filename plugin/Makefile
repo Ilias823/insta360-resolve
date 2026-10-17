@@ -20,13 +20,15 @@ OBJS    = build/Updater.o build/StitchPlugin.o build/Calibration.o build/Tracker
 
 all: $(BUNDLE)
 
-$(BUNDLE): $(OBJS) Info.plist build/TrackProgress build/SeamRefine build/MediaTool
+$(BUNDLE): $(OBJS) Info.plist build/TrackProgress build/SeamRefine build/MediaTool resources/icon.svg resources/icon.png
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources
 	$(CXX) $(OBJS) -o $(BUNDLE)/Contents/MacOS/$(NAME).ofx $(LDFLAGS)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp build/TrackProgress $(BUNDLE)/Contents/Resources/TrackProgress
 	cp build/SeamRefine $(BUNDLE)/Contents/Resources/SeamRefine
 	cp build/MediaTool $(BUNDLE)/Contents/Resources/MediaTool
+	cp resources/icon.svg $(BUNDLE)/Contents/Resources/org.insta360resolve.Stitch.svg
+	cp resources/icon.png $(BUNDLE)/Contents/Resources/org.insta360resolve.Stitch.png
 	codesign --force --sign - $(BUNDLE)/Contents/Resources/TrackProgress
 	codesign --force --sign - $(BUNDLE)/Contents/Resources/SeamRefine
 	codesign --force --sign - $(BUNDLE)/Contents/Resources/MediaTool
