@@ -77,6 +77,8 @@ ClipFiles LookupClip(int p_ClipId)
     const std::string path = std::string(home) + "/Library/Application Support/Insta360Stitch/clips/" + name + ".json";
     files.info = JsonString(path, "info");
     files.motion = JsonString(path, "motion");
+    files.lensA = JsonString(path, "lens_a");
+    files.lensB = JsonString(path, "lens_b");
     files.found = !files.info.empty();
     return files;
 }

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 enum StitchMode
 {
     eModeStitch = 0,     // dual fisheye in, equirectangular out
@@ -45,10 +48,29 @@ struct StitchParams
     float lens[2 * eLensSlotCount];
     int stabilize;   // 1 = turn every ray by stab (stabilisation), in both 360 and reframe output
     float stab[9];   // rows of the stabilised-view-to-camera rotation
+    int fullRes;     // 1 = sample the lens files decoded at full resolution (LensDecoder.h), not the input
+    int lensWidth;   // size of one decoded lens picture in pixels, fullRes only; lens is scaled to it
+    int lensHeight;
+    float seamLod;   // mip level the seam analysis reads, fullRes only
+    float yuvScale;  // decoded texture value * yuvScale = code value / (2^bits - 1)
+    float chromaMid; // zero chroma as code value / (2^bits - 1)
+};
+
+struct LensImages;
+
+// How often the decoded lenses matched the input picture (the kernel checks on every frame and
+// uses the input when they do not). Counted when the GPU has finished.
+struct FullResCheck
+{
+    std::atomic<int> matched{0};
+    std::atomic<int> mismatched{0};
+    std::atomic<float> lastDiff{0.0f}; // mean brightness difference of the last check, 0..1
 };
 
 // Reads the clip tag (ClipTag.h) from the source frame; returns the clip number or -1. Waits for the GPU.
 int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input);
 
 // Runs the kernel on host-provided MTLBuffers. Returns false if the shader failed to build.
-bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output);
+// With p_Params.fullRes the lenses are read from p_Lenses instead of p_Input.
+bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output,
+                          const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr);

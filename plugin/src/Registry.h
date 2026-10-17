@@ -9,6 +9,8 @@ struct ClipFiles
     bool found = false;
     std::string info;   // the clip's .json: calibration and more
     std::string motion; // camera motion for stabilisation, "" if the clip has none
+    std::string lensA;  // the lens files the clip is made of, for full resolution rendering
+    std::string lensB;
 };
 
 ClipFiles LookupClip(int p_ClipId);

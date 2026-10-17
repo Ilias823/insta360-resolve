@@ -13,10 +13,11 @@ SDK     = build/ofxsdk
 CXXFLAGS = -std=c++17 -O2 -fvisibility=hidden $(ARCH) -mmacosx-version-min=13.0 \
            -I$(SDK)/OpenFX-1.4/include -I$(SDK)/Support/include -Wno-deprecated-declarations \
            -DPLUGIN_VERSION='"$(VERSION)"'
-LDFLAGS = -bundle -fvisibility=hidden $(ARCH) -framework Metal -framework Foundation
+LDFLAGS = -bundle -fvisibility=hidden $(ARCH) -framework Metal -framework Foundation \
+          -framework AVFoundation -framework CoreMedia -framework CoreVideo
 
 SUPPORT = ofxsCore ofxsImageEffect ofxsInteract ofxsLog ofxsMultiThread ofxsParams ofxsProperty ofxsPropertyValidation
-OBJS    = build/Updater.o build/StitchPlugin.o build/Calibration.o build/Tracker.o build/Registry.o build/Motion.o build/ProgressWindow.o build/MetalKernel.o $(SUPPORT:%=build/%.o)
+OBJS    = build/Updater.o build/StitchPlugin.o build/Calibration.o build/Tracker.o build/Registry.o build/Motion.o build/ProgressWindow.o build/MetalKernel.o build/LensDecoder.o $(SUPPORT:%=build/%.o)
 
 all: $(BUNDLE)
 
@@ -46,7 +47,7 @@ build/SeamRefine: src/SeamRefine.cpp build/Calibration.o src/Calibration.h
 build/MediaTool: src/MediaTool.mm | $(SDK)
 	$(CXX) src/MediaTool.mm -o $@ $(ARCH) -mmacosx-version-min=13.0 -fobjc-arc -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework CoreVideo -framework ImageIO -framework Foundation
 
-build/%.o: src/%.cpp src/StitchKernel.h src/Calibration.h src/Tracker.h src/ProgressWindow.h src/ClipTag.h src/Registry.h src/Motion.h | $(SDK)
+build/%.o: src/%.cpp src/StitchKernel.h src/Calibration.h src/Tracker.h src/ProgressWindow.h src/ClipTag.h src/Registry.h src/Motion.h src/LensDecoder.h | $(SDK)
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
 
 build/StitchPlugin.o: Info.plist
@@ -54,7 +55,11 @@ build/StitchPlugin.o: Info.plist
 build/Updater.o: src/Updater.mm src/Updater.h | $(SDK)
 	$(CXX) -c $< -o $@ $(CXXFLAGS) -fobjc-arc
 
-build/%.o: src/%.mm src/StitchKernel.h | $(SDK)
+# Decodes the lens files at full resolution; ARC, unlike the Metal kernel.
+build/LensDecoder.o: src/LensDecoder.mm src/LensDecoder.h | $(SDK)
+	$(CXX) -c $< -o $@ $(CXXFLAGS) -fobjc-arc
+
+build/%.o: src/%.mm src/StitchKernel.h src/LensDecoder.h | $(SDK)
 	$(CXX) -c $< -o $@ $(CXXFLAGS) -fno-objc-arc
 
 build/ofxs%.o: | $(SDK)
@@ -68,9 +73,9 @@ $(SDK):
 test: $(BUNDLE) build/test_plugin
 	build/test_plugin $(BUNDLE)/Contents/MacOS/$(NAME).ofx
 
-build/test_plugin: test/test_plugin.mm build/MetalKernel.o build/Calibration.o build/Tracker.o src/StitchKernel.h src/Tracker.h
-	$(CXX) test/test_plugin.mm build/MetalKernel.o build/Calibration.o build/Tracker.o -o $@ $(CXXFLAGS) -fno-objc-arc -Isrc \
-	    -framework Metal -framework Foundation
+build/test_plugin: test/test_plugin.mm build/MetalKernel.o build/Calibration.o build/Tracker.o build/LensDecoder.o src/StitchKernel.h src/Tracker.h src/LensDecoder.h
+	$(CXX) test/test_plugin.mm build/MetalKernel.o build/Calibration.o build/Tracker.o build/LensDecoder.o -o $@ $(CXXFLAGS) -fno-objc-arc -Isrc \
+	    -framework Metal -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Accelerate
 
 install: $(BUNDLE)
 	mkdir -p "$(INSTALL_DIR)"

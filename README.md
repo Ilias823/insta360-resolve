@@ -9,6 +9,7 @@ Free and open source. If it saves you time, you can support its development on *
 - **Import**: Workspace > Scripts > Insta360 Import turns `.insv` clips into ready-to-edit `<name> 360` clips in an *Insta360* bin (no re-encoding; the lens calibration is read from each file and refined automatically). The lens files they are made from are kept out of the way in *Insta360 > Source files*.
 - **Stitch**: dual-fisheye to equirectangular on the GPU (Metal), with per-frame lens matching and an automatic stitch distance for close subjects.
 - **Reframe**: pan, tilt, roll, field of view and distance, with Insta360 Studio-style looks (Tiny Planet, Mega View, Ultra Wide, Dewarp, Linear). Works in timelines of any shape, including vertical. **Remove Distortion** keeps straight lines straight, like Insta360's linear view.
+- **Full resolution**: reads the lenses straight from the clip's own files (Apple's hardware decoder), so reframed views are as sharp as Insta360 Studio's in any timeline size, even a vertical 1080x1920 one where Resolve passes on only 540 pixels per lens. Falls back to Resolve's picture when the file is missing or does not match the frame (for example inside a Fusion comp). Can be turned off in the controls.
 - **Stabilization**: from the camera's own motion sensor, like Insta360's FlowState: Smooth (follows your camera moves), Locked Direction, and Level Horizon. Needs clips imported with version 0.2 or later.
 - **On-screen controls**: drag the picture to aim, drag the zoom bar to zoom (viewer set to *Open FX Overlay*).
 - **Subject tracking**: put the box on a subject and press Track Subject; the view follows it as Pan/Tilt keyframes.
@@ -51,7 +52,7 @@ installer/build_pkg.sh    # dist/Insta360Stitch-<version>.pkg
 
 ## How it works
 
-The X5 records the two lenses as two HEVC streams in one `.insv` file, with the factory calibration in a trailer at the end. The import copies each lens into its own `.mov` (Resolve reads one video stream per file) and builds a compound clip with lens A on the left half and lens B on the right half, a layout that holds in any timeline shape. The OpenFX plugin then stitches or reframes that compound clip using the calibration.
+The X5 records the two lenses as two HEVC streams in one `.insv` file, with the factory calibration in a trailer at the end. The import copies each lens into its own `.mov` (Resolve reads one video stream per file) and builds a compound clip with lens A on the left half and lens B on the right half, a layout that holds in any timeline shape. The OpenFX plugin then stitches or reframes that compound clip using the calibration. Resolve gives an effect only as many pixels as the timeline has, so with Full Resolution on the plugin decodes the lens files itself, keeps them as mipmapped Metal textures, and checks on every frame on the GPU that the decoded frame is the one Resolve passed in.
 
 ## Credits and licence
 

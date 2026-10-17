@@ -6,11 +6,20 @@
 // tools/compare_metal.py can check the result against the Python reference:
 //   test_plugin --stitch in.raw width height calibration.json|- out.raw flipY [pan tilt roll fov distance aspect]
 //
+// With --fullres it renders a frame of two lens files both ways, from the files decoded at full
+// resolution and from a Resolve-like input (the same frame scaled to the timeline), and reports
+// how much the colours differ, how much sharper full resolution is, and how long frames take:
+//   test_plugin --fullres lensA.mov lensB.mov frame width height calibration.json|- out_prefix [pan tilt roll fov distance aspect]
+//
 // With --track it runs the subject tracker over numbered raw frames (frame_0000.raw, ...), or
 // 8-bit RGB frames on stdin when dir is "-", and
 // prints one line per frame: index pan tilt confidence
 //   test_plugin --track dir width height count calibration.json|- pan tilt subjectDegrees
+#import <AVFoundation/AVFoundation.h>
+#import <Accelerate/Accelerate.h>
 #import <Metal/Metal.h>
+
+#include <chrono>
 
 #include <cmath>
 #include <cstdio>
@@ -21,6 +30,7 @@
 
 #include "ofxCore.h"
 #include "Calibration.h"
+#include "LensDecoder.h"
 #include "StitchKernel.h"
 #include "Tracker.h"
 
@@ -32,13 +42,14 @@ static void Check(bool p_Ok, const char* p_What)
     s_Failures += p_Ok ? 0 : 1;
 }
 
-static bool RunKernel(id<MTLCommandQueue> p_Queue, const StitchParams& p_Params, const std::vector<float>& p_In, std::vector<float>& p_Out)
+static bool RunKernelWith(id<MTLCommandQueue> p_Queue, const StitchParams& p_Params, const std::vector<float>& p_In, std::vector<float>& p_Out,
+                          const LensImages* p_Lenses, std::shared_ptr<FullResCheck> p_Check = nullptr)
 {
     const NSUInteger bytes = p_In.size() * sizeof(float);
     id<MTLBuffer> src = [p_Queue.device newBufferWithBytes:p_In.data() length:bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> dst = [p_Queue.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
 
-    const bool ok = RunStitchMetalKernel(p_Queue, p_Params, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst));
+    const bool ok = RunStitchMetalKernel(p_Queue, p_Params, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst), p_Lenses, p_Check);
 
     // The kernel commits without waiting; an empty command buffer on the same queue flushes it.
     id<MTLCommandBuffer> sync = [p_Queue commandBuffer];
@@ -49,6 +60,11 @@ static bool RunKernel(id<MTLCommandQueue> p_Queue, const StitchParams& p_Params,
     [src release];
     [dst release];
     return ok;
+}
+
+static bool RunKernel(id<MTLCommandQueue> p_Queue, const StitchParams& p_Params, const std::vector<float>& p_In, std::vector<float>& p_Out)
+{
+    return RunKernelWith(p_Queue, p_Params, p_In, p_Out, nullptr);
 }
 
 static int StitchFile(int argc, char** argv)
@@ -125,6 +141,225 @@ static int StitchFile(int argc, char** argv)
     }
     fclose(f);
     return 0;
+}
+
+// One frame of a lens file as 8-bit BGRA, converted by AVFoundation, scaled to p_W x p_H.
+static bool DecodeScaled(const char* p_Path, int p_Frame, int p_W, int p_H, std::vector<uint8_t>& p_Out)
+{
+    @autoreleasepool
+    {
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:@(p_Path)] options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+        AVAssetTrack* track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
+        AVAssetReaderTrackOutput* output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track
+            outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
+        [reader addOutput:output];
+        const CMTime duration = track.minFrameDuration;
+        reader.timeRange = CMTimeRangeMake(CMTimeMultiplyByFloat64(duration, fmax(p_Frame - 0.5, 0.0)), kCMTimePositiveInfinity);
+        [reader startReading];
+        CMSampleBufferRef sample = [output copyNextSampleBuffer];
+        if (!sample)
+        {
+            return false;
+        }
+        CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
+        CVPixelBufferLockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+        vImage_Buffer src = {CVPixelBufferGetBaseAddress(pixels), CVPixelBufferGetHeight(pixels), CVPixelBufferGetWidth(pixels),
+                             CVPixelBufferGetBytesPerRow(pixels)};
+        p_Out.resize(size_t(p_W) * p_H * 4);
+        vImage_Buffer dst = {p_Out.data(), vImagePixelCount(p_H), vImagePixelCount(p_W), size_t(p_W) * 4};
+        vImageScale_ARGB8888(&src, &dst, nullptr, kvImageHighQualityResampling);
+        CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+        CFRelease(sample);
+        [reader cancelReading];
+        return true;
+    }
+}
+
+static double Seconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static int FullResFile(int argc, char** argv)
+{
+    if (argc != 9 && argc != 15)
+    {
+        fprintf(stderr, "usage: test_plugin --fullres lensA.mov lensB.mov frame width height calibration.json|- out_prefix [pan tilt roll fov distance aspect]\n");
+        return 2;
+    }
+    const int frame = atoi(argv[4]);
+    StitchParams params = {};
+    params.width = atoi(argv[5]);
+    params.height = atoi(argv[6]);
+    params.mode = eModeStitch;
+    params.flipY = 1;
+    params.blendBand = float(sin(2.0 * M_PI / 180.0));
+    params.gainMatch = 1;
+    params.autoDistance = 1;
+    if (argc == 15)
+    {
+        params.mode = eModeReframe;
+        FillViewParams(atof(argv[9]), atof(argv[10]), atof(argv[11]), atof(argv[12]), atof(argv[13]), atof(argv[14]), params);
+    }
+    std::string raw = kNominalX5Calibration;
+    LensCalibration lenses[2];
+    if ((strcmp(argv[7], "-") != 0 && !ReadCalibrationFile(argv[7], raw)) || !ParseCalibration(raw, lenses))
+    {
+        fprintf(stderr, "cannot read calibration from %s\n", argv[7]);
+        return 1;
+    }
+    FillLensOffset(lenses, params);
+
+    // Resolve-like input: each lens scaled to half the frame, side by side, bottom row first.
+    const int tileW = params.width / 2;
+    std::vector<float> in(size_t(params.width) * params.height * 4), outResolve, outFull;
+    for (int lens = 0; lens < 2; ++lens)
+    {
+        std::vector<uint8_t> bgra;
+        if (!DecodeScaled(argv[2 + lens], frame, tileW, params.height, bgra))
+        {
+            fprintf(stderr, "cannot decode frame %d of %s\n", frame, argv[2 + lens]);
+            return 1;
+        }
+        for (int y = 0; y < params.height; ++y)
+        {
+            for (int x = 0; x < tileW; ++x)
+            {
+                const uint8_t* s = &bgra[(size_t(y) * tileW + x) * 4];
+                float* d = &in[((size_t(params.height - 1 - y)) * params.width + lens * tileW + x) * 4];
+                d[0] = s[2] / 255.0f;
+                d[1] = s[1] / 255.0f;
+                d[2] = s[0] / 255.0f;
+                d[3] = 1.0f;
+            }
+        }
+    }
+
+    @autoreleasepool
+    {
+        id<MTLCommandQueue> queue = [MTLCreateSystemDefaultDevice() newCommandQueue];
+        FillLensParams(lenses, params.width, params.height, params.lens);
+        if (!RunKernel(queue, params, in, outResolve))
+        {
+            return 1;
+        }
+
+        double start = Seconds();
+        LensImages images;
+        if (!AcquireLensImages(queue, argv[2], argv[3], frame, images))
+        {
+            fprintf(stderr, "cannot decode the lens files at full resolution\n");
+            return 1;
+        }
+        const double seek = Seconds() - start;
+        StitchParams full = params;
+        full.fullRes = 1;
+        full.lensWidth = images.width;
+        full.lensHeight = images.height;
+        full.seamLod = float(std::max(0.0, log2(images.width / 960.0)));
+        full.yuvScale = images.bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f;
+        full.chromaMid = images.bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
+        FillLensParams(lenses, 2 * images.width, images.height, full.lens);
+        auto check = std::make_shared<FullResCheck>();
+        RunKernelWith(queue, full, in, outFull, &images, check);
+        printf("frame check: %s, difference %.4f\n", check->matched == 1 ? "matched" : "NOT matched", double(check->lastDiff));
+        s_Failures += check->matched == 1 ? 0 : 1;
+
+        // A frame other than the input's must be noticed, and the input used instead.
+        LensImages other;
+        std::vector<float> outOther;
+        auto otherCheck = std::make_shared<FullResCheck>();
+        if (AcquireLensImages(queue, argv[2], argv[3], frame + 45, other))
+        {
+            RunKernelWith(queue, full, in, outOther, &other, otherCheck);
+            double worst = 0.0, total = 0.0;
+            for (size_t i = 0; i < outOther.size(); ++i)
+            {
+                worst = fmax(worst, fabs(outOther[i] - outResolve[i]));
+                total += fabs(outOther[i] - outResolve[i]);
+            }
+            printf("frame 45 later: %s, difference %.4f; output vs input path: mean %.4f max %.4f (8-bit levels)\n",
+                   otherCheck->mismatched == 1 ? "rejected" : "NOT rejected", double(otherCheck->lastDiff),
+                   total / outOther.size() * 255, worst * 255);
+            s_Failures += otherCheck->mismatched == 1 ? 0 : 1;
+        }
+
+        // Playing on: decode and render the next frames as a timeline would.
+        const int count = 60;
+        start = Seconds();
+        for (int i = 1; i <= count; ++i)
+        {
+            LensImages next;
+            std::vector<float> scratch;
+            if (!AcquireLensImages(queue, argv[2], argv[3], frame + i, next))
+            {
+                fprintf(stderr, "cannot decode frame %d\n", frame + i);
+                return 1;
+            }
+            RunKernelWith(queue, full, in, scratch, &next);
+        }
+        const double perFrame = (Seconds() - start) / count;
+        printf("lenses %dx%d %d-bit; first frame %.0f ms, then %.1f ms a frame (%.0f fps) at %dx%d\n",
+               images.width, images.height, images.bits, seek * 1000, perFrame * 1000, 1.0 / perFrame, params.width, params.height);
+    }
+
+    // Colour: compare 16 x 16 pixel block averages, which leaves out the difference in sharpness.
+    const int block = 16, bw = params.width / block, bh = params.height / block;
+    double diff[3] = {}, mean[2][3] = {}, detail[2] = {};
+    for (int by = 0; by < bh; ++by)
+    {
+        for (int bx = 0; bx < bw; ++bx)
+        {
+            double sums[2][3] = {};
+            for (int y = by * block; y < (by + 1) * block; ++y)
+            {
+                for (int x = bx * block; x < (bx + 1) * block; ++x)
+                {
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        sums[0][c] += outResolve[(size_t(y) * params.width + x) * 4 + c];
+                        sums[1][c] += outFull[(size_t(y) * params.width + x) * 4 + c];
+                    }
+                }
+            }
+            for (int c = 0; c < 3; ++c)
+            {
+                diff[c] += fabs(sums[1][c] - sums[0][c]) / (block * block);
+                mean[0][c] += sums[0][c] / (block * block);
+                mean[1][c] += sums[1][c] / (block * block);
+            }
+        }
+    }
+    // Sharpness: mean difference between neighbouring pixels.
+    for (int y = 0; y < params.height; ++y)
+    {
+        for (int x = 1; x < params.width; ++x)
+        {
+            const size_t i = (size_t(y) * params.width + x) * 4 + 1;
+            detail[0] += fabs(outResolve[i] - outResolve[i - 4]);
+            detail[1] += fabs(outFull[i] - outFull[i - 4]);
+        }
+    }
+    const double n = double(bw) * bh;
+    printf("mean RGB (8-bit levels): Resolve-like %.2f %.2f %.2f, full resolution %.2f %.2f %.2f\n",
+           mean[0][0] / n * 255, mean[0][1] / n * 255, mean[0][2] / n * 255, mean[1][0] / n * 255, mean[1][1] / n * 255, mean[1][2] / n * 255);
+    printf("colour difference of 16x16 block averages (8-bit levels): %.2f %.2f %.2f\n", diff[0] / n * 255, diff[1] / n * 255, diff[2] / n * 255);
+    printf("detail (neighbour difference), full resolution / Resolve-like: %.2f\n", detail[1] / fmax(detail[0], 1e-9));
+
+    for (int k = 0; k < 2; ++k)
+    {
+        const std::string path = std::string(argv[8]) + (k ? "_full.raw" : "_resolve.raw");
+        const std::vector<float>& out = k ? outFull : outResolve;
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f)
+        {
+            return 1;
+        }
+        fwrite(out.data(), sizeof(float), out.size(), f);
+        fclose(f);
+    }
+    return s_Failures == 0 ? 0 : 1;
 }
 
 static int TrackFiles(int argc, char** argv)
@@ -209,6 +444,10 @@ int main(int argc, char** argv)
     if (argc >= 2 && strcmp(argv[1], "--track") == 0)
     {
         return TrackFiles(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "--fullres") == 0)
+    {
+        return FullResFile(argc, argv);
     }
     if (argc >= 2 && strcmp(argv[1], "--stitch") == 0)
     {

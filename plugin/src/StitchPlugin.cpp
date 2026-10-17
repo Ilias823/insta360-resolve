@@ -26,6 +26,7 @@
 #include "ofxsSupportPrivate.h"
 
 #include "Calibration.h"
+#include "LensDecoder.h"
 #include "StitchKernel.h"
 #include "ProgressWindow.h"
 #include "ClipTag.h"
@@ -74,6 +75,9 @@
 #define kParamStabilize "stabilization"
 #define kParamSmoothness "smoothness"
 #define kParamLevel "levelHorizon"
+#define kParamFullRes "fullResolution"
+#define kFullResMinSize 480 // smaller renders, such as thumbnails, use Resolve's picture
+#define kFullResGiveUp 8     // frames that did not match the decoded file before an instance stops decoding
 #define kTagAttempts 30 // frames tried before deciding a clip has no tag (imported before tags existed)
 
 // The overlay counts as visible if the viewer drew it this recently.
@@ -126,6 +130,11 @@ public:
 
     void setSrcImg(OFX::Image* p_SrcImg) { m_SrcImg = p_SrcImg; }
     void setParams(const StitchParams& p_Params) { m_Params = p_Params; }
+    void setLensImages(const LensImages* p_Lenses, std::shared_ptr<FullResCheck> p_Check)
+    {
+        m_Lenses = p_Lenses;
+        m_Check = p_Check;
+    }
 
     void processImagesMetal() override;
     void multiThreadProcessImages(OfxRectI p_ProcWindow) override;
@@ -133,6 +142,8 @@ public:
 private:
     OFX::Image* m_SrcImg;
     StitchParams m_Params;
+    const LensImages* m_Lenses = nullptr;
+    std::shared_ptr<FullResCheck> m_Check;
 };
 
 void StitchProcessor::processImagesMetal()
@@ -140,7 +151,7 @@ void StitchProcessor::processImagesMetal()
     const float* input = static_cast<const float*>(m_SrcImg->getPixelData());
     float* output = static_cast<float*>(_dstImg->getPixelData());
 
-    if (!RunStitchMetalKernel(_pMetalCmdQ, m_Params, input, output))
+    if (!RunStitchMetalKernel(_pMetalCmdQ, m_Params, input, output, m_Lenses, m_Check))
     {
         LogOnce("ERROR: Metal kernel failed to build; see Resolve's console output");
         OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -244,6 +255,8 @@ private:
     OFX::ChoiceParam* m_Stabilize;
     OFX::DoubleParam* m_Smoothness;
     OFX::BooleanParam* m_Level;
+    OFX::BooleanParam* m_FullRes;
+    std::shared_ptr<FullResCheck> m_FullResCheck = std::make_shared<FullResCheck>();
     std::atomic<int> m_ClipId{0};
     std::atomic<int> m_TagAttempts{0};
     std::mutex m_ClipMutex;
@@ -281,6 +294,7 @@ StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
     m_Stabilize = fetchChoiceParam(kParamStabilize);
     m_Smoothness = fetchDoubleParam(kParamSmoothness);
     m_Level = fetchBooleanParam(kParamLevel);
+    m_FullRes = fetchBooleanParam(kParamFullRes);
 }
 
 void StitchPlugin::noteTag(int p_Id)
@@ -901,15 +915,64 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     params.autoDistance = m_AutoDistance->getValueAtTime(p_Args.time) ? 1 : 0;
     params.invDistance = float(1.0 / fmax(m_StitchDistance->getValueAtTime(p_Args.time), 0.1));
 
+    // Full resolution: Resolve only gives the effect as many pixels as the timeline has, so read
+    // the lenses from the clip's own files when that is more. Resolve's picture stays the fallback.
+    LensImages lensImages;
+    // The kernel checks that the decoded frame is the one Resolve passed in; where it never is,
+    // such as in Fusion, whose time counts from the start of the comp, decoding is a waste.
+    const bool neverMatched = m_FullResCheck->matched == 0 && m_FullResCheck->mismatched >= kFullResGiveUp;
+    if (neverMatched)
+    {
+        char check[160];
+        snprintf(check, sizeof(check), "full resolution: the decoded frames do not match Resolve's (difference %.3f); "
+                 "using Resolve's picture for this effect", double(m_FullResCheck->lastDiff));
+        LogOnce(check);
+    }
+    if ((params.mode == eModeStitch || params.mode == eModeReframe) && m_FullRes->getValueAtTime(p_Args.time) && !neverMatched &&
+        p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ && clipId() > 0 && std::max(params.width, params.height) >= kFullResMinSize)
+    {
+        const ClipFiles files = clipFiles();
+        if (files.lensA.empty() || files.lensB.empty())
+        {
+            LogOnce("full resolution: the clip's lens files are not registered; using Resolve's picture");
+        }
+        else if (!AcquireLensImages(p_Args.pMetalCmdQ, files.lensA, files.lensB, int(lround(p_Args.time)), lensImages))
+        {
+            LogOnce("ERROR: full resolution: cannot decode " + files.lensA + " / " + files.lensB + "; using Resolve's picture");
+        }
+        else if (lensImages.width > params.width / 2 || lensImages.height > params.height)
+        {
+            params.fullRes = 1;
+            params.lensWidth = lensImages.width;
+            params.lensHeight = lensImages.height;
+            // The seam analysis is tuned to lenses about 1000 pixels across.
+            params.seamLod = float(std::max(0.0, log2(lensImages.width / 960.0)));
+            params.yuvScale = lensImages.bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f; // 10-bit sits in the top of 16
+            params.chromaMid = lensImages.bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
+            char sizes[128];
+            snprintf(sizes, sizeof(sizes), "full resolution: lenses %dx%d %d-bit for a %dx%d frame",
+                     lensImages.width, lensImages.height, lensImages.bits, params.width, params.height);
+            LogOnce(sizes);
+        }
+    }
+
     LensCalibration lenses[2];
     loadCalibration(p_Args.time, lenses);
-    FillLensParams(lenses, params.width, params.height, params.lens);
+    if (params.fullRes != 0)
+    {
+        FillLensParams(lenses, 2 * params.lensWidth, params.lensHeight, params.lens);
+    }
+    else
+    {
+        FillLensParams(lenses, params.width, params.height, params.lens);
+    }
     FillLensOffset(lenses, params);
 
     StitchProcessor processor(*this);
     processor.setDstImg(dst.get());
     processor.setSrcImg(src.get());
     processor.setParams(params);
+    processor.setLensImages(params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck);
     processor.setGPURenderArgs(p_Args);
     processor.setRenderWindow(p_Args.renderWindow);
     processor.process();
@@ -1280,6 +1343,15 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     view->setDefault(1); // Reframe, the usual way to work with 360 footage
     view->setAnimates(false);
     page->addChild(*view);
+
+    OFX::BooleanParamDescriptor* fullRes = p_Desc.defineBooleanParam(kParamFullRes);
+    fullRes->setLabels("Full Resolution", "Full Resolution", "Full Resolution");
+    fullRes->setHint("Reads the lenses from the clip's own files at the full recorded resolution, as sharp as Insta360 Studio, "
+                     "instead of from Resolve, which only passes on as many pixels as the timeline has. Turn off if playback "
+                     "is too slow on this Mac. Grades applied before this effect do not reach the full resolution picture.");
+    fullRes->setDefault(true);
+    fullRes->setAnimates(false);
+    page->addChild(*fullRes);
 
     OFX::GroupParamDescriptor* stabilize = p_Desc.defineGroupParam("stabilizeGroup");
     stabilize->setLabels("Stabilization", "Stabilization", "Stabilization");

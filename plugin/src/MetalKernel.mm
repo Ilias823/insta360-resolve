@@ -4,6 +4,7 @@
 #include <unordered_map>
 
 #include "ClipTag.h"
+#include "LensDecoder.h"
 #include "StitchKernel.h"
 
 static const char* kKernelSource = R"METAL(
@@ -26,6 +27,8 @@ using namespace metal;
 #define DEPTH_PRIOR 0.05        // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
 #define DEFAULT_INV_DISTANCE 0.5
 #define DEPTH_TABLE_SIGMA_DEG 4.0
+#define MATCH_GRID 32           // points per side and lens where the decoded lenses are compared with the input
+#define MATCH_MAX_DIFF 0.04     // mean brightness difference above which the decoded frame is not the input's
 
 struct StitchParams
 {
@@ -45,7 +48,31 @@ struct StitchParams
     float lens[2 * LENS_SLOTS];
     int stabilize;
     float stab[9];
+    int fullRes;
+    int lensWidth;
+    int lensHeight;
+    float seamLod;
+    float yuvScale;
+    float chromaMid;
 };
+
+// Where the lens pictures come from: Resolve's input buffer, or with fullRes the lens files
+// decoded at full resolution, as luma and chroma textures per lens (LensDecoder.mm).
+struct Source
+{
+    bool decoded; // fullRes and the decoded frame matches the input; otherwise read the input
+    const device float* input;
+    texture2d<float> luma0;
+    texture2d<float> chroma0;
+    texture2d<float> luma1;
+    texture2d<float> chroma1;
+};
+
+// Size of one lens picture being sampled.
+static float2 LensSize(constant StitchParams& p)
+{
+    return p.fullRes != 0 ? float2(float(p.lensWidth), float(p.lensHeight)) : float2(float(p.width / 2), float(p.height));
+}
 
 static float4 ReadPixel(const device float* p_Input, int p_Index)
 {
@@ -77,6 +104,62 @@ static float4 SampleLens(const device float* p_Input, constant StitchParams& p, 
     return sum;
 }
 
+// Sample of a decoded lens at pixel-centre position p_Pos (y from the top), converted to RGB.
+// With p_Lod < 0 the mip level comes from the footprint p_Dx, p_Dy of an output pixel in lens
+// pixels, with anisotropic filtering; otherwise it is mip level p_Lod.
+static float3 SampleDecoded(texture2d<float> p_Luma, texture2d<float> p_Chroma, constant StitchParams& p, float2 p_Pos,
+                            float2 p_Dx, float2 p_Dy, float p_Lod)
+{
+    constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(8));
+    const float2 size = LensSize(p);
+    const float2 uv = (p_Pos + 0.5) / size;
+    // HEVC 4:2:0 chroma sits on even columns, between rows.
+    const float2 uvChroma = (float2(p_Pos.x * 0.5, (p_Pos.y - 0.5) * 0.5) + 0.5) / (size * 0.5);
+    float y;
+    float2 c;
+    if (p_Lod < 0.0)
+    {
+        const gradient2d grad(p_Dx / size, p_Dy / size);
+        y = p_Luma.sample(s, uv, grad).r;
+        c = p_Chroma.sample(s, uvChroma, grad).rg;
+    }
+    else
+    {
+        y = p_Luma.sample(s, uv, level(p_Lod)).r;
+        c = p_Chroma.sample(s, uvChroma, level(p_Lod)).rg;
+    }
+    // Full range BT.709, as the X5 records.
+    y *= p.yuvScale;
+    c = c * p.yuvScale - p.chromaMid;
+    return float3(y + 1.5748 * c.y, y - 0.187324 * c.x - 0.468124 * c.y, y + 1.8556 * c.x);
+}
+
+// Position in a lens tile of the input buffer for a position in a decoded lens.
+static float2 InputPos(constant StitchParams& p, float2 p_Pos)
+{
+    return (p_Pos + 0.5) * float2(float(p.width / 2), float(p.height)) / LensSize(p) - 0.5;
+}
+
+static float3 SampleSource(Source p_Src, constant StitchParams& p, int p_Lens, float2 p_Pos, float2 p_Dx, float2 p_Dy, float p_Lod)
+{
+    if (p.fullRes == 0)
+    {
+        return SampleLens(p_Src.input, p, p_Lens, p_Pos).rgb;
+    }
+    if (!p_Src.decoded)
+    {
+        return SampleLens(p_Src.input, p, p_Lens, InputPos(p, p_Pos)).rgb;
+    }
+    return p_Lens == 0 ? SampleDecoded(p_Src.luma0, p_Src.chroma0, p, p_Pos, p_Dx, p_Dy, p_Lod)
+                       : SampleDecoded(p_Src.luma1, p_Src.chroma1, p, p_Pos, p_Dx, p_Dy, p_Lod);
+}
+
+// For the seam analysis, which is tuned to pictures about 1000 pixels across.
+static float3 SeamSample(Source p_Src, constant StitchParams& p, int p_Lens, float2 p_Pos)
+{
+    return SampleSource(p_Src, p, p_Lens, p_Pos, float2(0.0), float2(0.0), p.seamLod);
+}
+
 // Projects a rig-space ray into a lens tile (MEI fisheye model). Returns false outside the image circle.
 static bool ProjectToLens(constant StitchParams& p, int p_Lens, float3 p_Ray, thread float2& p_Pos)
 {
@@ -104,7 +187,7 @@ static bool ProjectToLens(constant StitchParams& p, int p_Lens, float3 p_Ray, th
     p_Pos = float2(p.lens[o + 0] * xd + p.lens[o + 2], p.lens[o + 1] * yd + p.lens[o + 3]);
 
     // Image circle test, per axis so that squeezed frames work too.
-    const float2 radius = float2(float(p.width / 2), float(p.height)) * 0.5;
+    const float2 radius = LensSize(p) * 0.5;
     return length((p_Pos - radius) / radius) < 0.975;
 }
 
@@ -140,6 +223,10 @@ static float ColumnAngle(int p_A, int p_B)
 kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
                        const device float* p_Input [[buffer(0)]],
                        device float4* p_Table [[buffer(2)]],
+                       texture2d<float> p_Luma0 [[texture(0)]],
+                       texture2d<float> p_Chroma0 [[texture(1)]],
+                       texture2d<float> p_Luma1 [[texture(2)]],
+                       texture2d<float> p_Chroma1 [[texture(3)]],
                        uint tid [[thread_position_in_threadgroup]],
                        uint count [[threads_per_threadgroup]])
 {
@@ -148,6 +235,48 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
     threadgroup float colQ[SEAM_COLUMNS];
     threadgroup float4 colA[SEAM_COLUMNS]; // rgb sums, w = number of samples used
     threadgroup float4 colB[SEAM_COLUMNS];
+    threadgroup float2 matchSum[256]; // per thread: brightness difference, points
+
+    // With fullRes, first check that the decoded frame is the one in the input: the host's time
+    // is not always the frame in the file (in Fusion it counts from the start of the comp).
+    // Both are compared at the input's resolution, inside the image circles.
+    bool decoded = false;
+    if (p.fullRes != 0)
+    {
+        const Source probe = {true, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
+        const float2 size = LensSize(p);
+        const float2 footprint = size / float2(float(p.width / 2), float(p.height));
+        float2 sum = float2(0.0);
+        for (uint i = tid; i < 2 * MATCH_GRID * MATCH_GRID; i += count)
+        {
+            const int lens = int(i) / (MATCH_GRID * MATCH_GRID);
+            const int cell = int(i) % (MATCH_GRID * MATCH_GRID);
+            const float2 uv = (float2(float(cell % MATCH_GRID), float(cell / MATCH_GRID)) + 0.5) / MATCH_GRID;
+            if (length(uv * 2.0 - 1.0) > 0.85)
+            {
+                continue;
+            }
+            const float2 pos = uv * size - 0.5;
+            const float3 weights = float3(0.2126, 0.7152, 0.0722);
+            const float a = dot(SampleSource(probe, p, lens, pos, float2(footprint.x, 0.0), float2(0.0, footprint.y), -1.0), weights);
+            const float b = dot(SampleLens(p_Input, p, lens, InputPos(p, pos)).rgb, weights);
+            sum += float2(abs(a - b), 1.0);
+        }
+        matchSum[tid] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float2 total = float2(0.0);
+        for (uint t = 0; t < count; ++t)
+        {
+            total += matchSum[t];
+        }
+        const float diff = total.x / max(total.y, 1.0);
+        decoded = diff < MATCH_MAX_DIFF;
+        if (tid == 0)
+        {
+            p_Table[SEAM_BINS + 1] = float4(decoded ? 1.0 : 0.0, diff, 0.0, 0.0);
+        }
+    }
+    const Source src = {decoded, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
 
     const float stepQ = MAX_INV_DISTANCE / (DEPTH_STEPS - 1);
     if (p.autoDistance != 0)
@@ -165,8 +294,8 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
                     if (ProjectToLens(p, 0, LensRay(p, ray, k * stepQ, 1.0), posA) &&
                         ProjectToLens(p, 1, LensRay(p, ray, k * stepQ, -1.0), posB))
                     {
-                        const float3 a = SampleLens(p_Input, p, 0, posA).rgb;
-                        const float3 b = SampleLens(p_Input, p, 1, posB).rgb;
+                        const float3 a = SeamSample(src, p, 0, posA);
+                        const float3 b = SeamSample(src, p, 1, posB);
                         sum += abs((a.r + a.g + a.b) - (b.r + b.g + b.b)) / 3.0;
                         ++n;
                     }
@@ -233,8 +362,8 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
             {
                 continue;
             }
-            const float3 a = SampleLens(p_Input, p, 0, posA).rgb;
-            const float3 b = SampleLens(p_Input, p, 1, posB).rgb;
+            const float3 a = SeamSample(src, p, 0, posA);
+            const float3 b = SeamSample(src, p, 1, posB);
             const float la = (a.r + a.g + a.b) / 3.0, lb = (b.r + b.g + b.b) / 3.0;
             if (la > 0.02 && lb > 0.02 && la < 0.95 && lb < 0.95 && la < 2.0 * lb && lb < 2.0 * la)
             {
@@ -299,10 +428,51 @@ static float NearSeam(float3 p_Ray)
     return clamp((hi - abs(p_Ray.z)) / (hi - lo), 0.0, 1.0);
 }
 
+// Direction in the rig frame (x right, y down, z forward) seen at an output pixel, x and y from the
+// top left, stabilisation applied.
+static float3 OutputRay(constant StitchParams& p, float2 p_Pixel)
+{
+    const float2 uv = (p_Pixel + 0.5) / float2(float(p.width), float(p.height));
+    float3 ray;
+    if (p.mode == 0)
+    {
+        // Equirectangular: the whole sphere.
+        const float lon = uv.x * 2.0 * M_PI_F - M_PI_F;
+        const float lat = M_PI_F / 2.0 - uv.y * M_PI_F;
+        ray = float3(cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
+    }
+    else
+    {
+        // Virtual camera "distance" behind the sphere centre, looking along +z: follow its ray
+        // through this point of the image plane to the sphere, then rotate into the rig frame.
+        const float2 plane = (uv * 2.0 - 1.0) * float2(p.planeX, p.planeY);
+        const float d = p.distance;
+        const float r2 = dot(plane, plane);
+        const float t = (d + sqrt(max(1.0 + r2 * (1.0 - d * d), 0.0))) / (r2 + 1.0);
+        const float3 cam = float3(plane * t, t - d); // unit length
+        ray = float3(dot(float3(p.camRot[0], p.camRot[1], p.camRot[2]), cam),
+                     dot(float3(p.camRot[3], p.camRot[4], p.camRot[5]), cam),
+                     dot(float3(p.camRot[6], p.camRot[7], p.camRot[8]), cam));
+    }
+
+    if (p.stabilize != 0)
+    {
+        // Stabilisation: the view stays put while the camera moves, so turn the ray into the camera.
+        ray = float3(dot(float3(p.stab[0], p.stab[1], p.stab[2]), ray),
+                     dot(float3(p.stab[3], p.stab[4], p.stab[5]), ray),
+                     dot(float3(p.stab[6], p.stab[7], p.stab[8]), ray));
+    }
+    return ray;
+}
+
 kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
                          const device float* p_Input [[buffer(0)]],
                          const device float4* p_Table [[buffer(2)]],
                          device float* p_Output [[buffer(8)]],
+                         texture2d<float> p_Luma0 [[texture(0)]],
+                         texture2d<float> p_Chroma0 [[texture(1)]],
+                         texture2d<float> p_Luma1 [[texture(2)]],
+                         texture2d<float> p_Chroma1 [[texture(3)]],
                          uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= uint(p.width) || id.y >= uint(p.height))
@@ -317,36 +487,7 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
     {
         // Output pixel -> direction in the rig frame (x right, y down, z forward).
         const int yTop = p.flipY != 0 ? p.height - 1 - int(id.y) : int(id.y);
-        const float2 uv = float2((float(id.x) + 0.5) / float(p.width), (float(yTop) + 0.5) / float(p.height));
-        float3 ray;
-        if (p.mode == 0)
-        {
-            // Equirectangular: the whole sphere.
-            const float lon = uv.x * 2.0 * M_PI_F - M_PI_F;
-            const float lat = M_PI_F / 2.0 - uv.y * M_PI_F;
-            ray = float3(cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
-        }
-        else
-        {
-            // Virtual camera "distance" behind the sphere centre, looking along +z: follow its ray
-            // through this point of the image plane to the sphere, then rotate into the rig frame.
-            const float2 plane = (uv * 2.0 - 1.0) * float2(p.planeX, p.planeY);
-            const float d = p.distance;
-            const float r2 = dot(plane, plane);
-            const float t = (d + sqrt(max(1.0 + r2 * (1.0 - d * d), 0.0))) / (r2 + 1.0);
-            const float3 cam = float3(plane * t, t - d); // unit length
-            ray = float3(dot(float3(p.camRot[0], p.camRot[1], p.camRot[2]), cam),
-                         dot(float3(p.camRot[3], p.camRot[4], p.camRot[5]), cam),
-                         dot(float3(p.camRot[6], p.camRot[7], p.camRot[8]), cam));
-        }
-
-        if (p.stabilize != 0)
-        {
-            // Stabilisation: the view stays put while the camera moves, so turn the ray into the camera.
-            ray = float3(dot(float3(p.stab[0], p.stab[1], p.stab[2]), ray),
-                         dot(float3(p.stab[3], p.stab[4], p.stab[5]), ray),
-                         dot(float3(p.stab[6], p.stab[7], p.stab[8]), ray));
-        }
+        const float3 ray = OutputRay(p, float2(float(id.x), float(yTop)));
 
         // Each lens looks at the point at the stitch distance, so that things at that distance line up.
         const float4 seam = TableAt(p_Table, ray);
@@ -364,14 +505,29 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
         // Meet in the middle: lens A down by the square root of the gain, lens B up by it.
         const float3 overall = p_Table[SEAM_BINS].rgb;
         const float3 root = p.gainMatch != 0 ? sqrt(overall + (seam.rgb - overall) * near) : float3(1.0);
+        // The seam pass found whether the decoded frame is the input's.
+        const Source src = {p.fullRes != 0 && p_Table[SEAM_BINS + 1].x > 0.5, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
+        // Footprint of this output pixel in each lens, for filtering the full resolution pictures:
+        // where the neighbouring pixels land.
+        float2 dxA = float2(0.0), dyA = float2(0.0), dxB = float2(0.0), dyB = float2(0.0);
+        if (src.decoded)
+        {
+            const float3 rayX = OutputRay(p, float2(float(id.x) + 1.0, float(yTop)));
+            const float3 rayY = OutputRay(p, float2(float(id.x), float(yTop) + 1.0));
+            float2 q;
+            dxA = okA && ProjectToLens(p, 0, LensRay(p, rayX, seam.w * near, 1.0), q) ? q - posA : float2(0.0);
+            dyA = okA && ProjectToLens(p, 0, LensRay(p, rayY, seam.w * near, 1.0), q) ? q - posA : float2(0.0);
+            dxB = okB && ProjectToLens(p, 1, LensRay(p, rayX, seam.w * near, -1.0), q) ? q - posB : float2(0.0);
+            dyB = okB && ProjectToLens(p, 1, LensRay(p, rayY, seam.w * near, -1.0), q) ? q - posB : float2(0.0);
+        }
         float3 sum = float3(0.0);
         if (wA > 0.0)
         {
-            sum += wA * SampleLens(p_Input, p, 0, posA).rgb / root;
+            sum += wA * SampleSource(src, p, 0, posA, dxA, dyA, -1.0) / root;
         }
         if (wB > 0.0)
         {
-            sum += wB * SampleLens(p_Input, p, 1, posB).rgb * root;
+            sum += wB * SampleSource(src, p, 1, posB, dxB, dyB, -1.0) * root;
         }
         px = float4(sum / max(wA + wB, 1e-6), 1.0);
     }
@@ -417,6 +573,7 @@ struct Pipelines
     id<MTLComputePipelineState> stitch;
     id<MTLComputePipelineState> seam;
     id<MTLComputePipelineState> tag;
+    id<MTLTexture> placeholder; // bound in place of the decoded lenses when they are not used
 };
 
 static std::mutex s_PipelineMutex;
@@ -451,17 +608,20 @@ static Pipelines PipelinesForQueue(id<MTLCommandQueue> p_Queue)
     if (!library)
     {
         fprintf(stderr, "Insta360Stitch: Metal library failed to build: %s\n", err.localizedDescription.UTF8String);
-        return Pipelines{nil, nil, nil};
+        return Pipelines{nil, nil, nil, nil};
     }
 
-    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel")};
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:1 height:1 mipmapped:NO];
+    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel"),
+                           [device newTextureWithDescriptor:desc]};
     [library release];
     if (!pipelines.stitch || !pipelines.seam || !pipelines.tag)
     {
         [pipelines.stitch release];
         [pipelines.seam release];
         [pipelines.tag release];
-        return Pipelines{nil, nil, nil};
+        [pipelines.placeholder release];
+        return Pipelines{nil, nil, nil, nil};
     }
 
     s_Pipelines[(void*)p_Queue] = pipelines;
@@ -501,7 +661,8 @@ int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_
     return ClipTag::Decode(brightness);
 }
 
-bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output)
+bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output, const LensImages* p_Lenses,
+                          std::shared_ptr<FullResCheck> p_Check)
 {
     id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(p_CmdQ);
     const Pipelines pipelines = PipelinesForQueue(queue);
@@ -519,13 +680,38 @@ bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const floa
 
     // Per-frame seam table, filled on the GPU by the first pass and read by the second; the
     // command buffer keeps it alive until both have run.
-    id<MTLBuffer> tableBuf = [queue.device newBufferWithLength:(kSeamBins + 1) * 4 * sizeof(float) options:MTLResourceStorageModePrivate];
+    // With full resolution the CPU reads the result of the frame check from it afterwards.
+    const bool decoded = p_Params.fullRes != 0 && p_Lenses;
+    id<MTLBuffer> tableBuf = [queue.device newBufferWithLength:(kSeamBins + 2) * 4 * sizeof(float)
+                                                       options:decoded ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate];
 
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     [encoder setBuffer:srcBuf offset:0 atIndex:0];
     [encoder setBuffer:tableBuf offset:0 atIndex:2];
     [encoder setBuffer:dstBuf offset:0 atIndex:8];
-    [encoder setBytes:&p_Params length:sizeof(StitchParams) atIndex:1];
+    StitchParams params = p_Params;
+    params.fullRes = decoded ? 1 : 0;
+    [encoder setBytes:&params length:sizeof(StitchParams) atIndex:1];
+    for (int i = 0; i < 4; ++i)
+    {
+        [encoder setTexture:decoded ? static_cast<id<MTLTexture>>(p_Lenses->textures[i]) : pipelines.placeholder atIndex:i];
+    }
+    if (decoded)
+    {
+        // The decoded lenses must live until the GPU has read them.
+        std::shared_ptr<void> owner = p_Lenses->owner;
+        [tableBuf retain];
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> p_Done) {
+            (void)owner;
+            const float* check = static_cast<const float*>(tableBuf.contents) + (kSeamBins + 1) * 4;
+            if (p_Check && p_Done.status == MTLCommandBufferStatusCompleted)
+            {
+                (check[0] > 0.5f ? p_Check->matched : p_Check->mismatched)++;
+                p_Check->lastDiff = check[1];
+            }
+            [tableBuf release];
+        }];
+    }
 
     if (p_Params.mode == eModeStitch || p_Params.mode == eModeReframe)
     {
