@@ -3,6 +3,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "ClipTag.h"
 #include "StitchKernel.h"
 
 static const char* kKernelSource = R"METAL(
@@ -42,6 +43,8 @@ struct StitchParams
     float invDistance;
     float lensOffset[3];
     float lens[2 * LENS_SLOTS];
+    int stabilize;
+    float stab[9];
 };
 
 static float4 ReadPixel(const device float* p_Input, int p_Index)
@@ -337,6 +340,14 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
                          dot(float3(p.camRot[6], p.camRot[7], p.camRot[8]), cam));
         }
 
+        if (p.stabilize != 0)
+        {
+            // Stabilisation: the view stays put while the camera moves, so turn the ray into the camera.
+            ray = float3(dot(float3(p.stab[0], p.stab[1], p.stab[2]), ray),
+                         dot(float3(p.stab[3], p.stab[4], p.stab[5]), ray),
+                         dot(float3(p.stab[6], p.stab[7], p.stab[8]), ray));
+        }
+
         // Each lens looks at the point at the stitch distance, so that things at that distance line up.
         const float4 seam = TableAt(p_Table, ray);
         const float near = NearSeam(ray);
@@ -383,12 +394,29 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
     p_Output[index + 2] = px.b;
     p_Output[index + 3] = px.a;
 }
+// Brightness at the centres of the clip tag's 32 cells (positions computed on the CPU, ClipTag.h).
+kernel void TagKernel(constant StitchParams& p [[buffer(1)]],
+                      const device float* p_Input [[buffer(0)]],
+                      constant int2* p_Cells [[buffer(2)]],
+                      device float* p_Out [[buffer(3)]],
+                      uint i [[thread_position_in_grid]])
+{
+    if (i >= 32)
+    {
+        return;
+    }
+    const int2 c = clamp(p_Cells[i], int2(0, 0), int2(p.width - 1, p.height - 1));
+    const int row = p.flipY != 0 ? p.height - 1 - c.y : c.y;
+    const float4 px = ReadPixel(p_Input, (row * p.width + c.x) * 4);
+    p_Out[i] = dot(px.rgb, float3(0.299, 0.587, 0.114));
+}
 )METAL";
 
 struct Pipelines
 {
     id<MTLComputePipelineState> stitch;
     id<MTLComputePipelineState> seam;
+    id<MTLComputePipelineState> tag;
 };
 
 static std::mutex s_PipelineMutex;
@@ -423,20 +451,54 @@ static Pipelines PipelinesForQueue(id<MTLCommandQueue> p_Queue)
     if (!library)
     {
         fprintf(stderr, "Insta360Stitch: Metal library failed to build: %s\n", err.localizedDescription.UTF8String);
-        return Pipelines{nil, nil};
+        return Pipelines{nil, nil, nil};
     }
 
-    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel")};
+    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel")};
     [library release];
-    if (!pipelines.stitch || !pipelines.seam)
+    if (!pipelines.stitch || !pipelines.seam || !pipelines.tag)
     {
         [pipelines.stitch release];
         [pipelines.seam release];
-        return Pipelines{nil, nil};
+        [pipelines.tag release];
+        return Pipelines{nil, nil, nil};
     }
 
     s_Pipelines[(void*)p_Queue] = pipelines;
     return pipelines;
+}
+
+int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input)
+{
+    id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(p_CmdQ);
+    const Pipelines pipelines = PipelinesForQueue(queue);
+    if (!pipelines.tag)
+    {
+        return -1;
+    }
+
+    int cells[ClipTag::kBits * 2];
+    for (int bit = 0; bit < ClipTag::kBits; ++bit)
+    {
+        ClipTag::CellCentre(bit, p_Params.width, p_Params.height, cells[bit * 2], cells[bit * 2 + 1]);
+    }
+    id<MTLBuffer> out = [queue.device newBufferWithLength:ClipTag::kBits * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipelines.tag];
+    [encoder setBuffer:reinterpret_cast<id<MTLBuffer>>(const_cast<float*>(p_Input)) offset:0 atIndex:0];
+    [encoder setBytes:&p_Params length:sizeof(StitchParams) atIndex:1];
+    [encoder setBytes:cells length:sizeof(cells) atIndex:2];
+    [encoder setBuffer:out offset:0 atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(ClipTag::kBits, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+
+    float brightness[ClipTag::kBits];
+    memcpy(brightness, out.contents, sizeof(brightness));
+    [out release];
+    return ClipTag::Decode(brightness);
 }
 
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output)

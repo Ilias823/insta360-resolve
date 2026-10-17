@@ -16,7 +16,7 @@ CXXFLAGS = -std=c++17 -O2 -fvisibility=hidden $(ARCH) -mmacosx-version-min=13.0 
 LDFLAGS = -bundle -fvisibility=hidden $(ARCH) -framework Metal -framework Foundation
 
 SUPPORT = ofxsCore ofxsImageEffect ofxsInteract ofxsLog ofxsMultiThread ofxsParams ofxsProperty ofxsPropertyValidation
-OBJS    = build/Updater.o build/StitchPlugin.o build/Calibration.o build/Tracker.o build/ProgressWindow.o build/MetalKernel.o $(SUPPORT:%=build/%.o)
+OBJS    = build/Updater.o build/StitchPlugin.o build/Calibration.o build/Tracker.o build/Registry.o build/Motion.o build/ProgressWindow.o build/MetalKernel.o $(SUPPORT:%=build/%.o)
 
 all: $(BUNDLE)
 
@@ -44,9 +44,9 @@ build/SeamRefine: src/SeamRefine.cpp build/Calibration.o src/Calibration.h
 
 # Splits and reads clips for tools/ingest.py with AVFoundation, so importing needs no ffmpeg.
 build/MediaTool: src/MediaTool.mm | $(SDK)
-	$(CXX) src/MediaTool.mm -o $@ $(ARCH) -mmacosx-version-min=13.0 -fobjc-arc -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework Foundation
+	$(CXX) src/MediaTool.mm -o $@ $(ARCH) -mmacosx-version-min=13.0 -fobjc-arc -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework CoreVideo -framework ImageIO -framework Foundation
 
-build/%.o: src/%.cpp src/StitchKernel.h src/Calibration.h src/Tracker.h src/ProgressWindow.h | $(SDK)
+build/%.o: src/%.cpp src/StitchKernel.h src/Calibration.h src/Tracker.h src/ProgressWindow.h src/ClipTag.h src/Registry.h src/Motion.h | $(SDK)
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
 
 build/StitchPlugin.o: Info.plist

@@ -18,6 +18,8 @@ Preferences > System > General > External scripting set to Local.
 import argparse
 import json
 import os
+import random
+import struct
 import subprocess
 import sys
 import time
@@ -27,6 +29,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from insv_trailer import read_summary
+import clip_tag
+import insv_motion
 
 RESOLVE_API = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
 RESOLVE_LIB = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
@@ -185,8 +189,59 @@ def split(src, out_dir, report=lambda fraction: None):
                 info[key] = old[key]
     except (OSError, ValueError, KeyError):
         pass
+    # Camera motion for stabilisation, and the tag that lets the plugin find all of this.
+    motion = out_dir / f"{src.stem}.motion"
+    try:
+        data = insv_motion.motion_data(src, info["frames"], float(info["fps"]), info["camera"])
+    except (OSError, ValueError, KeyError, struct.error):
+        data = None
+    if data:
+        motion.write_bytes(data)
+    info["motion"] = motion.name if data else ""
+    try:
+        old_id = int(json.loads(path.read_text()).get("clip_id", -1))
+    except (OSError, ValueError, KeyError):
+        old_id = -1
+    path.write_text(json.dumps(info, indent=2))
+    info["clip_id"] = register_clip(path, lens_files, motion if data else None, old_id)
+    info["tag"] = make_tag_movie(info, out_dir / f"{src.stem}_tag")
     path.write_text(json.dumps(info, indent=2))
     return lens_files[0], lens_files[1], info
+
+
+def make_tag_movie(info, base):
+    """The clip's tag as a transparent movie exactly as long as the clip; "" if it cannot be made.
+
+    A movie, not the image itself: Resolve keeps a still on a timeline for a few seconds only.
+    """
+    png, movie = base.with_suffix(".png"), base.with_suffix(".mov")
+    clip_tag.write_tag_png(info["clip_id"], png, 512, 256)
+    tool = media_tool()
+    if tool is None:
+        return ""
+    rate = str(Fraction(info["fps"]).limit_denominator(1001)) if "/" not in str(info["fps"]) else info["fps"]
+    rate = {"29.97": "30000/1001", "59.94": "60000/1001", "23.976": "24000/1001"}.get(str(info["fps"]), rate)
+    done = subprocess.run([str(tool), "still", str(png), str(info["frames"]), rate, str(movie)], capture_output=True, text=True)
+    png.unlink(missing_ok=True)
+    return str(movie) if done.returncode == 0 else ""
+
+
+def register_clip(info_path, lens_files, motion_path, clip_id=-1):
+    """Adds a clip to the registry the plugin reads (Registry.cpp); returns its number.
+
+    The number is what the clip's tag encodes. A clip imported again keeps its number.
+    """
+    folder = SUPPORT_DIR / "clips"
+    folder.mkdir(parents=True, exist_ok=True)
+    if not 0 < clip_id < (1 << 24):
+        taken = {p.stem for p in folder.glob("*.json")}
+        clip_id = random.randrange(1, 1 << 24)
+        while f"{clip_id:06x}" in taken:
+            clip_id = random.randrange(1, 1 << 24)
+    entry = {"info": str(Path(info_path).resolve()), "lens_a": str(Path(lens_files[0]).resolve()),
+             "lens_b": str(Path(lens_files[1]).resolve()), "motion": str(Path(motion_path).resolve()) if motion_path else ""}
+    (folder / f"{clip_id:06x}.json").write_text(json.dumps(entry, indent=2))
+    return clip_id
 
 
 def adjusted_lenses(lenses, x):
@@ -397,6 +452,20 @@ def get_bin(pool):
     return pool.AddSubFolder(root, BIN_NAME)
 
 
+def add_tag_track(pool, timeline, tag_path, start):
+    """Covers the clip with its tag movie on a third track (see clip_tag.py); returns the items."""
+    if not tag_path or not Path(tag_path).exists():
+        return []
+    imported = pool.ImportMedia([str(tag_path)]) or []
+    if not imported:
+        return []
+    timeline.AddTrack("video")
+    items = pool.AppendToTimeline([{"mediaPoolItem": imported[0], "trackIndex": 3, "recordFrame": start}]) or []
+    for item in items:
+        item.SetProperty("Scaling", 4)       # stretched over the frame, like the lenses
+    return items
+
+
 def build(project, lens_a, lens_b, info, name):
     pool = project.GetMediaPool()
     folder = get_bin(pool)
@@ -442,14 +511,16 @@ def build(project, lens_a, lens_b, info, name):
         item.SetProperty("ZoomX", 0.5)
         item.SetProperty("ZoomY", 1.0)
         item.SetProperty("Pan", side * width / 4.0)
-    compound = timeline.CreateCompoundClip([item_a, item_b], {"name": compound_name})
+    tag_items = add_tag_track(pool, timeline, info.get("tag"), start)
+    compound = timeline.CreateCompoundClip([item_a, item_b] + tag_items, {"name": compound_name})
     if compound is None:
         raise RuntimeError(f"{name}: could not create compound clip")
     # As the Scripts-menu entry does: the working timeline goes (the compound clip keeps its own
     # copy) and the lens files move into a sub-bin, so the bin shows only the "<name> 360" clips.
     pool.DeleteTimelines([timeline])
     sources = next((f for f in folder.GetSubFolderList() or [] if f.GetName() == SOURCE_BIN_NAME), None)
-    pool.MoveClips([a, b], sources or pool.AddSubFolder(folder, SOURCE_BIN_NAME))
+    pool.MoveClips([a, b] + ([tag_items[0].GetMediaPoolItem()] if tag_items else []),
+                   sources or pool.AddSubFolder(folder, SOURCE_BIN_NAME))
     pool.SetCurrentFolder(folder)
     return f"'{compound_name}' created, {width}x{height} @ {info['fps']}{warning}"
 
@@ -471,7 +542,7 @@ def main():
     ap.add_argument("--notify", action="store_true", help="show the result in a dialog when done (implies --progress)")
     ap.add_argument("--progress", action="store_true", help="show a progress window while working")
     ap.add_argument("--report", type=Path, help="write one tab-separated line per clip for the Scripts-menu entry: "
-                    "name, lens A, lens B, width, height, fps, note (or FAILED and a message)")
+                    "name, lens A, lens B, width, height, fps, note, tag image (or FAILED and a message)")
     args = ap.parse_args()
     if args.refine:
         return refine_existing(args.clips)
@@ -514,7 +585,7 @@ def main():
                 except Exception as e:
                     note = f"; seam calibration not refined: {e}"
             rows.append([src.stem, str(lens_a.resolve()), str(lens_b.resolve()), str(info["width"]),
-                         str(info["height"]), str(info["fps"]), note.lstrip("; ")])
+                         str(info["height"]), str(info["fps"]), note.lstrip("; "), info.get("tag", "")])
             if project:
                 stage(0.95, 1.0, "adding to Resolve")
                 msg = build(project, lens_a.resolve(), lens_b.resolve(), info, src.stem)

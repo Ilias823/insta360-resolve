@@ -5,8 +5,12 @@
 //   MediaTool split <clip> <lensA> <lensB>   copy each video stream to its own .mov, without
 //                                            re-encoding; prints "progress <0..1>" lines
 //   MediaTool frame <video> <seconds> <size> one frame scaled to size x size, raw 8-bit RGB on stdout
+//   MediaTool still <image> <frames> <rate> <out.mov>
+//                                            a still image (with transparency) as a ProRes 4444 movie of
+//                                            exactly <frames> frames at <rate> (e.g. 30000/1001)
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 
 #include <cstdio>
 #include <unistd.h>
@@ -185,6 +189,87 @@ static int Frame(NSString* p_Path, double p_Seconds, int p_Size)
     return fwrite(rgb.data(), 1, rgb.size(), stdout) == rgb.size() ? 0 : 1;
 }
 
+// Resolve keeps a still image on a timeline for at most a few seconds, so the clip tag is turned
+// into a movie of exactly the clip's length.
+static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p_Output)
+{
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:p_Image], nil);
+    CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nil) : nil;
+    if (source)
+    {
+        CFRelease(source);
+    }
+    if (!image)
+    {
+        return Fail([NSString stringWithFormat:@"cannot read %@", p_Image]);
+    }
+    const size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    NSArray<NSString*>* rate = [p_Rate componentsSeparatedByString:@"/"];
+    const int32_t timescale = rate.count == 2 ? rate[0].intValue : int32_t(p_Rate.doubleValue * 1000);
+    const int64_t duration = rate.count == 2 ? rate[1].longLongValue : 1000;
+    if (timescale <= 0 || duration <= 0 || p_Frames <= 0)
+    {
+        CGImageRelease(image);
+        return Fail(@"bad frame count or rate");
+    }
+
+    [NSFileManager.defaultManager removeItemAtPath:p_Output error:nil];
+    NSError* error = nil;
+    AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:p_Output] fileType:AVFileTypeQuickTimeMovie error:&error];
+    AVAssetWriterInput* input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
+        AVVideoCodecKey: AVVideoCodecTypeAppleProRes4444, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height)}];
+    AVAssetWriterInputPixelBufferAdaptor* adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
+        sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                                      (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height)}];
+    if (!writer || ![writer canAddInput:input])
+    {
+        CGImageRelease(image);
+        return Fail([NSString stringWithFormat:@"cannot write %@: %@", p_Output, error.localizedDescription]);
+    }
+    // Without this the movie's time scale is 600, which cannot hold 1001/30000 exactly: Resolve would
+    // then see 30 fps instead of 29.97 and skip a frame now and then.
+    input.mediaTimeScale = timescale;
+    writer.movieTimeScale = timescale;
+    [writer addInput:input];
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    CVPixelBufferRef pixels = nil;
+    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &pixels);
+    CVPixelBufferLockBaseAddress(pixels, 0);
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pixels), width, height, 8, CVPixelBufferGetBytesPerRow(pixels),
+                                                 space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGContextClearRect(context, CGRectMake(0, 0, width, height));
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+    CGColorSpaceRelease(space);
+    CVPixelBufferUnlockBaseAddress(pixels, 0);
+    CGImageRelease(image);
+
+    for (long i = 0; i < p_Frames; ++i)
+    {
+        while (!input.readyForMoreMediaData)
+        {
+            usleep(1000);
+        }
+        if (![adaptor appendPixelBuffer:pixels withPresentationTime:CMTimeMake(i * duration, timescale)])
+        {
+            CVPixelBufferRelease(pixels);
+            return Fail([NSString stringWithFormat:@"writing %@ failed: %@", p_Output, writer.error.localizedDescription]);
+        }
+    }
+    CVPixelBufferRelease(pixels);
+    [input markAsFinished];
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [writer endSessionAtSourceTime:CMTimeMake(p_Frames * duration, timescale)];
+    [writer finishWritingWithCompletionHandler:^{
+        dispatch_semaphore_signal(done);
+    }];
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return writer.status == AVAssetWriterStatusCompleted ? 0 : Fail(writer.error.localizedDescription ?: @"writing failed");
+}
+
 int main(int argc, const char** argv)
 {
     @autoreleasepool
@@ -203,11 +288,16 @@ int main(int argc, const char** argv)
             }
             return Split(@(argv[2]), outputs);
         }
+        if ([command isEqualToString:@"still"] && argc == 6)
+        {
+            return Still(@(argv[2]), atol(argv[3]), @(argv[4]), @(argv[5]));
+        }
         if ([command isEqualToString:@"frame"] && argc == 5)
         {
             return Frame(@(argv[2]), atof(argv[3]), atoi(argv[4]));
         }
-        fprintf(stderr, "usage: MediaTool probe <clip> | split <clip> <out1> <out2> | frame <video> <seconds> <size>\n");
+        fprintf(stderr, "usage: MediaTool probe <clip> | split <clip> <out1> <out2> | frame <video> <seconds> <size> | "
+                        "still <image> <frames> <rate> <out.mov>\n");
         return 2;
     }
 }

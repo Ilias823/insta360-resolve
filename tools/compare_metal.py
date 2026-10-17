@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from insv_trailer import read_summary
-from stitch_poc import camera_rays, decode, load_calibration, stitch
+from stitch_poc import camera_rays, decode, load_calibration, rot_x, rot_y, rot_z, stitch
 
 TEST_BIN = Path(__file__).parent.parent / "plugin/build/test_plugin"
 MAX_MEAN_DIFF = 0.5   # in 8-bit levels
@@ -45,6 +45,13 @@ if __name__ == "__main__":
         rays = camera_rays(w, h, pan, tilt, roll, fov, dist, aspect)
         cases.append((f"reframe pan {pan} tilt {tilt} roll {roll} fov {fov} distance {dist}",
                       [str(x) for x in (pan, tilt, roll, fov, dist, aspect)], rays))
+
+    # Stabilisation turns every ray by a rotation (view to camera) before sampling the lenses.
+    stab = rot_y(25.0) @ rot_x(-12.0) @ rot_z(8.0)
+    stab_arg = ",".join(f"{v:.9f}" for v in stab.ravel())
+    view = camera_rays(w, h, 30, 5, 0, 100, 0.25, 16 / 9)
+    cases.append(("reframe, stabilised", [str(x) for x in (30, 5, 0, 100, 0.25, 16 / 9)] + [stab_arg],
+                  (stab @ view.reshape(3, -1)).reshape(view.shape)))
 
     side_by_side = np.concatenate(frames, axis=1)[..., ::-1].astype(np.float32) / 255.0
     rgba = np.concatenate([side_by_side, np.ones((lw, 2 * lw, 1), np.float32)], axis=2)

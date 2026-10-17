@@ -28,6 +28,9 @@
 #include "Calibration.h"
 #include "StitchKernel.h"
 #include "ProgressWindow.h"
+#include "ClipTag.h"
+#include "Motion.h"
+#include "Registry.h"
 #include "Tracker.h"
 #include "Updater.h"
 
@@ -68,6 +71,10 @@
 #define kParamBoxY "subjectY"
 #define kParamOverlayTip "overlayTip"
 #define kParamBaseDistance "baseDistance"
+#define kParamStabilize "stabilization"
+#define kParamSmoothness "smoothness"
+#define kParamLevel "levelHorizon"
+#define kTagAttempts 30 // frames tried before deciding a clip has no tag (imported before tags existed)
 
 // The overlay counts as visible if the viewer drew it this recently.
 #define kOverlaySeenSeconds 3.0
@@ -184,6 +191,14 @@ public:
 private:
     void applyStyle(int p_Style);
     void loadCalibration(double p_Time, LensCalibration p_Lenses[2]);
+
+    // The clip this effect is on, from its tag: > 0 known, 0 not read yet, -1 none.
+    int clipId() const { return m_ClipId.load(); }
+    void noteTag(int p_Id);
+    ClipFiles clipFiles();
+    // Stabilisation for a frame: rotation from the stabilised view to the camera. False when off
+    // or when the clip has no motion data.
+    bool stabilization(double p_Time, double p_R[9]);
     void trackSubject(double p_Time);
     // Field of view and distance actually used: Remove Distortion turns the lens straight.
     void viewLens(double p_Time, double& p_Fov, double& p_Distance) const
@@ -226,6 +241,14 @@ private:
     OFX::DoubleParam* m_BoxY;
     OFX::DoubleParam* m_BaseDistance;
     bool m_ApplyingStyle = false;
+    OFX::ChoiceParam* m_Stabilize;
+    OFX::DoubleParam* m_Smoothness;
+    OFX::BooleanParam* m_Level;
+    std::atomic<int> m_ClipId{0};
+    std::atomic<int> m_TagAttempts{0};
+    std::mutex m_ClipMutex;
+    ClipFiles m_ClipFiles;
+    bool m_ClipFilesRead = false;
 };
 
 StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
@@ -255,6 +278,58 @@ StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
     m_BoxX = fetchDoubleParam(kParamBoxX);
     m_BoxY = fetchDoubleParam(kParamBoxY);
     m_BaseDistance = fetchDoubleParam(kParamBaseDistance);
+    m_Stabilize = fetchChoiceParam(kParamStabilize);
+    m_Smoothness = fetchDoubleParam(kParamSmoothness);
+    m_Level = fetchBooleanParam(kParamLevel);
+}
+
+void StitchPlugin::noteTag(int p_Id)
+{
+    if (p_Id > 0)
+    {
+        m_ClipId.store(p_Id);
+        char line[64];
+        snprintf(line, sizeof(line), "clip tag %06x", p_Id);
+        LogOnce(line);
+    }
+    else if (++m_TagAttempts >= kTagAttempts && m_ClipId.load() == 0)
+    {
+        m_ClipId.store(-1);
+        LogOnce("a clip without a tag (imported before 0.2): factory calibration, no stabilisation");
+    }
+}
+
+ClipFiles StitchPlugin::clipFiles()
+{
+    std::lock_guard<std::mutex> lock(m_ClipMutex);
+    if (!m_ClipFilesRead && clipId() > 0)
+    {
+        m_ClipFiles = LookupClip(clipId());
+        m_ClipFilesRead = true;
+        if (!m_ClipFiles.found)
+        {
+            LogOnce("ERROR: clip tag found but the clip is not registered on this Mac; import it here");
+        }
+    }
+    return m_ClipFiles;
+}
+
+bool StitchPlugin::stabilization(double p_Time, double p_R[9])
+{
+    int mode = 0;
+    m_Stabilize->getValueAtTime(p_Time, mode);
+    if (mode == 0 || clipId() <= 0)
+    {
+        return false;
+    }
+    const ClipFiles files = clipFiles();
+    const std::shared_ptr<const MotionData> motion = files.motion.empty() ? nullptr : MotionData::Load(files.motion);
+    if (!motion)
+    {
+        return false;
+    }
+    motion->viewToCamera(p_Time, mode, m_Smoothness->getValueAtTime(p_Time), m_Level->getValueAtTime(p_Time), p_R);
+    return true;
 }
 
 // ~/Library/Application Support/Insta360Stitch/default-calibration.json, written by tools/ingest.py.
@@ -293,7 +368,12 @@ void StitchPlugin::loadCalibration(double p_Time, LensCalibration p_Lenses[2])
     std::string calibrationPath;
     m_CalibrationFile->getValueAtTime(p_Time, calibrationPath);
     std::string raw = kNominalX5Calibration;
-    if (calibrationPath.empty())
+    const ClipFiles files = calibrationPath.empty() ? clipFiles() : ClipFiles();
+    if (files.found && ReadCalibrationFile(files.info, raw))
+    {
+        LogOnce("using the clip's own calibration (from its tag)");
+    }
+    else if (calibrationPath.empty())
     {
         // The import tool leaves the latest imported clip's calibration here; cameras differ, so
         // that is a better default than the built-in values (which come from one particular X5).
@@ -354,6 +434,29 @@ void StitchPlugin::trackSubject(double p_Time)
     double pan = atan2(ray[0], ray[2]) * 180.0 / M_PI;
     double tilt = asin(fmin(fmax(-ray[1] / len, -1.0), 1.0)) * 180.0 / M_PI;
     pan += 360.0 * round((camPan - pan) / 360.0);
+    // Pan and Tilt aim the stabilised view; the tracker works in the footage itself. These turn
+    // directions between the two for a frame (identity without stabilisation).
+    auto toCamera = [&](double p_At, double p_Pan, double p_Tilt, double& p_CamPan, double& p_CamTilt) {
+        double s[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        stabilization(p_At, s);
+        const double v[3] = {cos(p_Tilt * M_PI / 180.0) * sin(p_Pan * M_PI / 180.0), -sin(p_Tilt * M_PI / 180.0),
+                             cos(p_Tilt * M_PI / 180.0) * cos(p_Pan * M_PI / 180.0)};
+        const double c[3] = {s[0] * v[0] + s[1] * v[1] + s[2] * v[2], s[3] * v[0] + s[4] * v[1] + s[5] * v[2],
+                             s[6] * v[0] + s[7] * v[1] + s[8] * v[2]};
+        p_CamPan = atan2(c[0], c[2]) * 180.0 / M_PI;
+        p_CamTilt = asin(fmin(fmax(-c[1], -1.0), 1.0)) * 180.0 / M_PI;
+    };
+    auto toView = [&](double p_At, double p_CamPan, double p_CamTilt, double p_NearPan, double& p_Pan, double& p_Tilt) {
+        double s[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        stabilization(p_At, s);
+        const double c[3] = {cos(p_CamTilt * M_PI / 180.0) * sin(p_CamPan * M_PI / 180.0), -sin(p_CamTilt * M_PI / 180.0),
+                             cos(p_CamTilt * M_PI / 180.0) * cos(p_CamPan * M_PI / 180.0)};
+        const double v[3] = {s[0] * c[0] + s[3] * c[1] + s[6] * c[2], s[1] * c[0] + s[4] * c[1] + s[7] * c[2],
+                             s[2] * c[0] + s[5] * c[1] + s[8] * c[2]};
+        p_Pan = atan2(v[0], v[2]) * 180.0 / M_PI;
+        p_Pan += 360.0 * round((p_NearPan - p_Pan) / 360.0);
+        p_Tilt = asin(fmin(fmax(-v[1], -1.0), 1.0)) * 180.0 / M_PI;
+    };
 
     // The camera keeps the same offset from the subject, so the subject stays where the box is.
     const double offsetPan = camPan - pan, offsetTilt = camTilt - tilt;
@@ -405,7 +508,24 @@ void StitchPlugin::trackSubject(double p_Time)
         sendMessage(OFX::Message::eMessageError, "", "Tracking failed: Resolve did not provide the video frames.");
         return;
     }
-    tracker.start(frame, pan, tilt);
+    if (clipId() == 0)
+    {
+        // The tag tells which clip's motion data to use; read it from this frame if not yet known.
+        float brightness[ClipTag::kBits];
+        for (int bit = 0; bit < ClipTag::kBits; ++bit)
+        {
+            int x, y;
+            ClipTag::CellCentre(bit, frame.width, frame.height, x, y);
+            const int row = frame.bottomUp ? frame.height - 1 - y : y;
+            const float* px = reinterpret_cast<const float*>(frame.data + long(row) * frame.rowBytes) + x * 4;
+            brightness[bit] = 0.299f * px[0] + 0.587f * px[1] + 0.114f * px[2];
+        }
+        noteTag(ClipTag::Decode(brightness));
+    }
+    double camSubjectPan, camSubjectTilt;
+    toCamera(p_Time, pan, tilt, camSubjectPan, camSubjectTilt);
+    tracker.start(frame, camSubjectPan, camSubjectTilt);
+    double camPanNow = camSubjectPan, camTiltNow = camSubjectTilt;
 
     const auto started = std::chrono::steady_clock::now();
     std::vector<double> times = {p_Time}, pans = {pan}, tilts = {tilt};
@@ -440,11 +560,12 @@ void StitchPlugin::trackSubject(double p_Time)
             break;
         }
         double confidence = 0.0;
-        if (!tracker.step(frame, pan, tilt, confidence))
+        if (!tracker.step(frame, camPanNow, camTiltNow, confidence))
         {
             stop = eLost;
             break;
         }
+        toView(t, camPanNow, camTiltNow, pans.back(), pan, tilt);
         times.push_back(t);
         pans.push_back(pan);
         tilts.push_back(tilt);
@@ -749,6 +870,21 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     int view = 0;
     m_View->getValueAtTime(p_Args.time, view);
     params.mode = kViewModes[view >= 0 && view < 4 ? view : 0];
+
+    // Which clip this is, from the tag the import put in its corners (read once, on the GPU).
+    if (clipId() == 0 && p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ)
+    {
+        noteTag(ReadClipTagMetal(p_Args.pMetalCmdQ, params, static_cast<const float*>(src->getPixelData())));
+    }
+    double stab[9];
+    if ((params.mode == eModeStitch || params.mode == eModeReframe) && stabilization(p_Args.time, stab))
+    {
+        params.stabilize = 1;
+        for (int i = 0; i < 9; ++i)
+        {
+            params.stab[i] = float(stab[i]);
+        }
+    }
 
     if (params.mode == eModeReframe)
     {
@@ -1144,6 +1280,42 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     view->setDefault(1); // Reframe, the usual way to work with 360 footage
     view->setAnimates(false);
     page->addChild(*view);
+
+    OFX::GroupParamDescriptor* stabilize = p_Desc.defineGroupParam("stabilizeGroup");
+    stabilize->setLabels("Stabilization", "Stabilization", "Stabilization");
+    stabilize->setHint("Uses the camera's motion sensor, like Insta360's FlowState. Needs a clip imported with "
+                       "Insta360 Import 0.2 or later; timelapse clips have no motion data.");
+
+    OFX::ChoiceParamDescriptor* stabMode = p_Desc.defineChoiceParam(kParamStabilize);
+    stabMode->setLabels("Stabilization", "Stabilization", "Stabilization");
+    stabMode->setHint("Smooth removes shake but follows where you turn the camera. Locked Direction keeps looking "
+                      "the same way as at the start of the clip, whatever the camera does.");
+    stabMode->appendOption("Off");
+    stabMode->appendOption("Smooth");
+    stabMode->appendOption("Locked Direction");
+    stabMode->setDefault(1);
+    stabMode->setAnimates(false);
+    stabMode->setParent(*stabilize);
+    page->addChild(*stabMode);
+
+    OFX::DoubleParamDescriptor* smoothness = p_Desc.defineDoubleParam(kParamSmoothness);
+    smoothness->setLabels("Smoothness", "Smoothness", "Smoothness");
+    smoothness->setHint("How calmly Smooth follows the camera: seconds of movement averaged. Higher is steadier.");
+    smoothness->setDefault(1.0);
+    smoothness->setRange(0.1, 5.0);
+    smoothness->setDisplayRange(0.1, 5.0);
+    smoothness->setIncrement(0.1);
+    smoothness->setAnimates(false);
+    smoothness->setParent(*stabilize);
+    page->addChild(*smoothness);
+
+    OFX::BooleanParamDescriptor* level = p_Desc.defineBooleanParam(kParamLevel);
+    level->setLabels("Level Horizon", "Level Horizon", "Level Horizon");
+    level->setHint("Keeps the horizon straight, using the camera's sense of gravity.");
+    level->setDefault(true);
+    level->setAnimates(false);
+    level->setParent(*stabilize);
+    page->addChild(*level);
 
     OFX::GroupParamDescriptor* reframe = p_Desc.defineGroupParam("reframe");
     reframe->setLabels("Reframe", "Reframe", "Reframe");

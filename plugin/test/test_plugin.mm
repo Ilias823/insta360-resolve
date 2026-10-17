@@ -53,7 +53,8 @@ static bool RunKernel(id<MTLCommandQueue> p_Queue, const StitchParams& p_Params,
 
 static int StitchFile(int argc, char** argv)
 {
-    if (argc != 8 && argc != 14)
+    // An optional 15th argument holds a stabilisation rotation: 9 comma-separated numbers.
+    if (argc != 8 && argc != 14 && argc != 15)
     {
         fprintf(stderr, "usage: test_plugin --stitch in.raw width height calibration.json|- out.raw flipY [pan tilt roll fov distance aspect]\n");
         return 2;
@@ -67,10 +68,20 @@ static int StitchFile(int argc, char** argv)
     params.blendBand = float(sin(2.0 * M_PI / 180.0));
     params.gainMatch = 1;
     params.autoDistance = 1;
-    if (argc == 14)
+    if (argc >= 14)
     {
         params.mode = eModeReframe;
         FillViewParams(atof(argv[8]), atof(argv[9]), atof(argv[10]), atof(argv[11]), atof(argv[12]), atof(argv[13]), params);
+    }
+    if (argc == 15)
+    {
+        params.stabilize = 1;
+        const char* p = argv[14];
+        for (int i = 0; i < 9; ++i)
+        {
+            params.stab[i] = float(strtod(p, const_cast<char**>(&p)));
+            p += (*p == ',') ? 1 : 0;
+        }
     }
 
     std::string raw = kNominalX5Calibration;

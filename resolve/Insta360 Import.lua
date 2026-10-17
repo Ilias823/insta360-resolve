@@ -101,7 +101,8 @@ if f then
             table.insert(messages, fields[2])
         elseif #fields >= 6 then
             table.insert(clips, {name = fields[1], lensA = fields[2], lensB = fields[3], width = tonumber(fields[4]),
-                                 height = tonumber(fields[5]), fps = fields[6], note = fields[7] or ""})
+                                 height = tonumber(fields[5]), fps = fields[6], note = fields[7] or "",
+                                 tag = fields[8] or ""})
         end
     end
     f:close()
@@ -134,7 +135,7 @@ sourceFolder = sourceFolder or pool:AddSubFolder(folder, SOURCE_BIN_NAME)
 local stray = {}
 for _, item in ipairs(folder:GetClipList() or {}) do
     local name = item:GetName() or ""
-    if name:match("_lens[AB]%.mov$") then
+    if name:match("_lens[AB]%.mov$") or name:match("_tag%.mov$") then
         table.insert(stray, item)
     end
 end
@@ -145,6 +146,24 @@ pool:SetCurrentFolder(folder)
 
 local function basename(path)
     return path:match("([^/]+)$")
+end
+
+-- The clip's tag (see tools/clip_tag.py), a transparent movie as long as the clip, over it on a
+-- third track, so the plugin can tell which clip it is working on.
+local function addTagTrack(timeline, tagPath, start)
+    if tagPath == "" or not exists(tagPath) then
+        return {}, nil
+    end
+    local imported = pool:ImportMedia({tagPath}) or {}
+    if not imported[1] then
+        return {}, nil
+    end
+    timeline:AddTrack("video")
+    local items = pool:AppendToTimeline({{mediaPoolItem = imported[1], trackIndex = 3, recordFrame = start}}) or {}
+    for _, item in ipairs(items) do
+        item:SetProperty("Scaling", 4)
+    end
+    return items, imported[1]
 end
 
 local function build(clip)
@@ -197,13 +216,18 @@ local function build(clip)
         placed[1]:SetProperty("ZoomY", 1.0)
         placed[1]:SetProperty("Pan", placed[2] * width / 4.0)
     end
-    if not timeline:CreateCompoundClip({itemA, itemB}, {name = compoundName}) then
+    local tagItems, tagMedia = addTagTrack(timeline, clip.tag, start)
+    local parts = {itemA, itemB}
+    for _, item in ipairs(tagItems) do
+        table.insert(parts, item)
+    end
+    if not timeline:CreateCompoundClip(parts, {name = compoundName}) then
         return "FAILED: could not create the compound clip"
     end
     -- The working timeline is not needed once the compound clip exists (it keeps its own copy),
     -- and the lens files go out of sight into the sub-bin.
     pool:DeleteTimelines({timeline})
-    pool:MoveClips({a, b}, sourceFolder)
+    pool:MoveClips(tagMedia and {a, b, tagMedia} or {a, b}, sourceFolder)
     pool:SetCurrentFolder(folder)
     return "ready"
 end

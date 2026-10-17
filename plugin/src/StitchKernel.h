@@ -43,7 +43,12 @@ struct StitchParams
     float invDistance; // 1 / stitch distance in metres when autoDistance is 0; 0 = infinity
     float lensOffset[3]; // position of lens B relative to lens A in the rig frame, metres
     float lens[2 * eLensSlotCount];
+    int stabilize;   // 1 = turn every ray by stab (stabilisation), in both 360 and reframe output
+    float stab[9];   // rows of the stabilised-view-to-camera rotation
 };
+
+// Reads the clip tag (ClipTag.h) from the source frame; returns the clip number or -1. Waits for the GPU.
+int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input);
 
 // Runs the kernel on host-provided MTLBuffers. Returns false if the shader failed to build.
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output);
