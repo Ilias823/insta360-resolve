@@ -23,7 +23,14 @@ rm -rf "${stage:?}"
 root="$stage/root"
 mkdir -p "$root/Library/OFX/Plugins" "$root$support/tools" "$root$scripts_dir" "$stage/dist"
 cp -R "$project/plugin/build/Insta360Stitch.ofx.bundle" "$root/Library/OFX/Plugins/"
-cp "$project/tools/ingest.py" "$project/tools/insv_trailer.py" "$root$support/tools/"
+# The import tool and every module it uses (standard library only besides these).
+cp "$project/tools/ingest.py" "$project/tools/insv_trailer.py" "$project/tools/insv_motion.py" \
+   "$project/tools/clip_tag.py" "$root$support/tools/"
+# Fail here rather than on the user's Mac if a module is missing: load it the way Resolve will.
+resolve_python="/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython"
+check_python="$( [ -x "$resolve_python" ] && echo "$resolve_python" || command -v python3 )"
+"$check_python" -I -c "import sys; sys.path.insert(0, '$root$support/tools'); import ingest" \
+    || { echo "the packaged import tool does not load" >&2; exit 1; }
 cp "$here/uninstall.sh" "$root$support/uninstall.sh"
 chmod 755 "$root$support/uninstall.sh"
 sed -e "s|@INGEST@|$support/tools/ingest.py|" "$project/resolve/Insta360 Import.lua" > "$root$scripts_dir/Insta360 Import.lua"
