@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Insta360 Stitch for DaVinci Resolve</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="13.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" title="Insta360 Stitch">
+        <pkg-ref id="org.insta360resolve.stitch"/>
+    </choice>
+    <pkg-ref id="org.insta360resolve.stitch" version="@VERSION@" onConclusion="none">Insta360Stitch.pkg</pkg-ref>
+</installer-gui-script>

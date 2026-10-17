@@ -1,0 +1,19 @@
+# Footage and renders stay local (large, and private)
+samples/
+work/
+*.insv
+*.insp
+*.mov
+*.mp4
+
+# Builds
+plugin/build/
+installer/build/
+dist/
+
+# Python
+.venv/
+__pycache__/
+
+# macOS
+.DS_Store
