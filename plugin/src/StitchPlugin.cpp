@@ -811,7 +811,17 @@ void StitchPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args, const st
         if (p_ParamName == kParamDistance)
         {
             // A Distance chosen by hand is the look to come back to when zooming in again.
-            m_BaseDistance->setValue(m_Distance->getValueAtTime(p_Args.time));
+            const double chosen = m_Distance->getValueAtTime(p_Args.time);
+            m_BaseDistance->setValue(chosen);
+            // Wide views need a minimum curve (AutoDistance), so below it the slider would change
+            // nothing: put it back at the minimum, so it always shows what is used.
+            const double minimum = AutoDistance(m_Fov->getValueAtTime(p_Args.time));
+            if (chosen < minimum - 1e-4)
+            {
+                m_ApplyingStyle = true;
+                m_Distance->setValue(minimum);
+                m_ApplyingStyle = false;
+            }
         }
         else
         {
@@ -1409,7 +1419,7 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     struct Slider { const char* name; const char* label; const char* hint; double def, min, max, displayMin, displayMax, increment; };
     const Slider sliders[] = {
         {kParamFov, "Field of View", "How much of the scene fits across the longer side of the frame, in degrees. Above 100 the picture curves automatically so the edges do not stretch.", 110.0, kFovMin, 340.0, kFovMin, 340.0, 0.1},
-        {kParamDistance, "Distance", "How far the camera sits behind the centre of the sphere: 0 keeps straight lines straight, towards 1 the picture curves like an action camera. Wide fields of view raise it automatically as needed.", 0.25, 0.0, 1.0, 0.0, 1.0, 0.01},
+        {kParamDistance, "Distance", "How far the camera sits behind the centre of the sphere: 0 keeps straight lines straight, towards 1 the picture curves like an action camera. Fields of view above 100 degrees need some curve, so there it cannot go below a minimum (about 0.6 at 200 degrees).", 0.25, 0.0, 1.0, 0.0, 1.0, 0.01},
         {kParamPan, "Pan", "Turns the view left and right, in degrees. Keeps going past 180 for full spins.", 0.0, -3600.0, 3600.0, -180.0, 180.0, 0.1},
         {kParamTilt, "Tilt", "Tips the view up and down, in degrees.", 0.0, -180.0, 180.0, -90.0, 90.0, 0.1},
         {kParamRoll, "Roll", "Rotates the horizon, in degrees.", 0.0, -3600.0, 3600.0, -180.0, 180.0, 0.1},
