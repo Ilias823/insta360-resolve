@@ -67,7 +67,9 @@
 #ifndef PLUGIN_VERSION
 #define PLUGIN_VERSION "0.0.0" // set by the Makefile from Info.plist
 #endif
-#define kParamTrack "trackSubject"
+#define kParamTrack "trackSubject" // forward; the id is kept so older projects keep their button
+#define kParamTrackBack "trackBackward"
+#define kParamTrackBoth "trackBothWays"
 #define kParamBoxX "subjectX"
 #define kParamBoxY "subjectY"
 #define kParamOverlayTip "overlayTip"
@@ -210,7 +212,8 @@ private:
     // Stabilisation for a frame: rotation from the stabilised view to the camera. False when off
     // or when the clip has no motion data.
     bool stabilization(double p_Time, double p_R[9]);
-    void trackSubject(double p_Time);
+    // p_Directions: 1 forward, 2 backward, 3 both ways from the current frame.
+    void trackSubject(double p_Time, int p_Directions);
     // Field of view and distance actually used: Remove Distortion turns the lens straight.
     void viewLens(double p_Time, double& p_Fov, double& p_Distance) const
     {
@@ -415,18 +418,18 @@ void StitchPlugin::loadCalibration(double p_Time, LensCalibration p_Lenses[2])
 // Follows whatever is in the box at the centre of the view, from the current frame forward,
 // and writes Pan and Tilt keyframes that keep it centred. Stops at the end of the clip, after
 // Track Length, when the subject is lost, or when the user cancels.
-void StitchPlugin::trackSubject(double p_Time)
+void StitchPlugin::trackSubject(double p_Time, int p_Directions)
 {
     if (!m_ShowBox->getValue())
     {
         m_ShowBox->setValue(true);
-        sendMessage(OFX::Message::eMessageMessage, "", "The yellow box is on now: put it on the subject and press Track Subject again.");
+        sendMessage(OFX::Message::eMessageMessage, "", "The yellow box is on now: put it on the subject and track again.");
         return;
     }
     if (SecondsNow() - s_OverlayDrawn.load() > kOverlaySeenSeconds)
     {
         sendMessage(OFX::Message::eMessageMessage, "",
-                    "Turn on Open FX Overlay (viewer menu, bottom-left), drag the yellow box onto the subject, then press Track Subject.");
+                    "Turn on Open FX Overlay (viewer menu, bottom-left), drag the yellow box onto the subject, then track again.");
         return;
     }
 
@@ -484,7 +487,7 @@ void StitchPlugin::trackSubject(double p_Time)
     ViewPointToRay(view, boxU + boxHalf * longSide / fmax(rodW, 1.0), boxV, right);
     const double dot = (left[0] * right[0] + left[1] * right[1] + left[2] * right[2]) /
                        sqrt((left[0] * left[0] + left[1] * left[1] + left[2] * left[2]) * (right[0] * right[0] + right[1] * right[1] + right[2] * right[2]));
-    SubjectTracker tracker(lenses, acos(fmin(fmax(dot, -1.0), 1.0)) * 180.0 / M_PI);
+    const double subjectDeg = acos(fmin(fmax(dot, -1.0), 1.0)) * 180.0 / M_PI;
 
     // The clip's last frame: the earlier of where the footage and where this clip's output end
     // (a trimmed clip uses only part of its footage).
@@ -500,7 +503,9 @@ void StitchPlugin::trackSubject(double p_Time)
     const double clipStart = trimmed ? timelineStart : srcRange.min;
     const double clipEnd = trimmed ? timelineEnd : (dstRange.max > dstRange.min ? fmin(srcRange.max, dstRange.max) : srcRange.max);
     const double fps = m_SrcClip->getFrameRate() > 0.0 ? m_SrcClip->getFrameRate() : 30.0;
-    const double end = m_TrackToEnd->getValueAtTime(p_Time) ? clipEnd : fmin(clipEnd, p_Time + m_TrackLength->getValueAtTime(p_Time) * fps);
+    const double reach = m_TrackToEnd->getValueAtTime(p_Time) ? 1e12 : m_TrackLength->getValueAtTime(p_Time) * fps;
+    const double end = (p_Directions & 1) ? fmin(clipEnd, p_Time + reach) : p_Time;
+    const double begin = (p_Directions & 2) ? fmax(clipStart, p_Time - reach) : p_Time;
 
     auto fetch = [&](double p_At, std::unique_ptr<OFX::Image>& p_Image, FrameView& p_View) {
         p_Image.reset(m_SrcClip->fetchImage(p_At));
@@ -538,75 +543,124 @@ void StitchPlugin::trackSubject(double p_Time)
     }
     double camSubjectPan, camSubjectTilt;
     toCamera(p_Time, pan, tilt, camSubjectPan, camSubjectTilt);
-    tracker.start(frame, camSubjectPan, camSubjectTilt);
-    double camPanNow = camSubjectPan, camTiltNow = camSubjectTilt;
-
+    // One pass per direction, each starting again from the box at the current frame.
+    enum Stop { eEnd, eLost, eCancelled, eNoFrame };
+    struct Pass
+    {
+        std::vector<double> times, pans, tilts; // starts with the current frame
+        Stop stop = eEnd;
+    };
     const auto started = std::chrono::steady_clock::now();
-    std::vector<double> times = {p_Time}, pans = {pan}, tilts = {tilt};
-    enum { eEnd, eLost, eCancelled, eNoFrame } stop = eEnd;
-    size_t lastGood = 0; // last frame whose match could be trusted
+    const double total = fmax((end - p_Time) + (p_Time - begin), 1.0);
+    double done = 0.0;
     progressStart("Tracking subject");
     ProgressWindow window;
     window.open("Tracking Subject");
-    const double total = fmax(end - p_Time, 1.0);
-    for (double t = p_Time + 1.0; t <= end; t += 1.0)
+
+    auto runPass = [&](double p_Step, double p_Limit) {
+        Pass pass;
+        pass.times = {p_Time};
+        pass.pans = {pan};
+        pass.tilts = {tilt};
+        SubjectTracker tracker(lenses, subjectDeg);
+        if (!fetch(p_Time, image, frame))
+        {
+            pass.stop = eNoFrame;
+            return pass;
+        }
+        tracker.start(frame, camSubjectPan, camSubjectTilt);
+        double camPanNow = camSubjectPan, camTiltNow = camSubjectTilt, panNow = pan, tiltNow = tilt;
+        size_t lastGood = 0; // last frame whose match could be trusted
+        for (double t = p_Time + p_Step; p_Step > 0 ? t <= p_Limit : t >= p_Limit; t += p_Step)
+        {
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            char status[128];
+            if (done >= 5.0)
+            {
+                snprintf(status, sizeof(status), "Frame %.0f of %.0f  ·  about %.0f s left", done + 1.0, total,
+                         elapsed / done * (total - done));
+            }
+            else
+            {
+                snprintf(status, sizeof(status), "Frame %.0f of %.0f", done + 1.0, total);
+            }
+            done += 1.0;
+            if (!progressUpdate(done / total) || !window.update(done / total, status))
+            {
+                pass.stop = eCancelled;
+                break;
+            }
+            if (!fetch(t, image, frame))
+            {
+                pass.stop = eNoFrame;
+                break;
+            }
+            double confidence = 0.0;
+            if (!tracker.step(frame, camPanNow, camTiltNow, confidence))
+            {
+                pass.stop = eLost;
+                break;
+            }
+            toView(t, camPanNow, camTiltNow, panNow, panNow, tiltNow);
+            pass.times.push_back(t);
+            pass.pans.push_back(panNow);
+            pass.tilts.push_back(tiltNow);
+            if (SubjectTracker::isConfident(confidence))
+            {
+                lastGood = pass.times.size() - 1;
+            }
+        }
+        if (pass.stop == eLost)
+        {
+            // Keyframes end where the subject was last seen clearly, not where the tracker gave up.
+            pass.times.resize(lastGood + 1);
+            pass.pans.resize(lastGood + 1);
+            pass.tilts.resize(lastGood + 1);
+        }
+        return pass;
+    };
+
+    Pass backward, forward;
+    if (p_Directions & 2)
     {
-        const double done = t - p_Time - 1.0;
-        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        char status[128];
-        if (done >= 5.0)
-        {
-            snprintf(status, sizeof(status), "Frame %.0f of %.0f  ·  about %.0f s left", done + 1.0, total,
-                     elapsed / done * (total - done));
-        }
-        else
-        {
-            snprintf(status, sizeof(status), "Frame %.0f of %.0f", done + 1.0, total);
-        }
-        if (!progressUpdate((t - p_Time) / total) || !window.update((t - p_Time) / total, status))
-        {
-            stop = eCancelled;
-            break;
-        }
-        if (!fetch(t, image, frame))
-        {
-            stop = eNoFrame;
-            break;
-        }
-        double confidence = 0.0;
-        if (!tracker.step(frame, camPanNow, camTiltNow, confidence))
-        {
-            stop = eLost;
-            break;
-        }
-        toView(t, camPanNow, camTiltNow, pans.back(), pan, tilt);
-        times.push_back(t);
-        pans.push_back(pan);
-        tilts.push_back(tilt);
-        if (SubjectTracker::isConfident(confidence))
-        {
-            lastGood = times.size() - 1;
-        }
+        backward = runPass(-1.0, begin);
     }
-    if (stop == eLost)
+    if ((p_Directions & 1) && backward.stop != eCancelled)
     {
-        // Keyframes end where the subject was last seen clearly, not where the tracker gave up.
-        times.resize(lastGood + 1);
-        pans.resize(lastGood + 1);
-        tilts.resize(lastGood + 1);
+        forward = runPass(1.0, end);
     }
     window.close();
     progressEnd();
     image.reset();
 
+    // One sequence in time order: the backward pass reversed, then the forward pass.
+    std::vector<double> times, pans, tilts;
+    for (size_t i = backward.times.size(); i-- > 1;)
+    {
+        times.push_back(backward.times[i]);
+        pans.push_back(backward.pans[i]);
+        tilts.push_back(backward.tilts[i]);
+    }
+    const size_t startIndex = times.size(); // the current frame, kept exactly as aimed
+    times.push_back(p_Time);
+    pans.push_back(pan);
+    tilts.push_back(tilt);
+    for (size_t i = 1; i < forward.times.size(); ++i)
+    {
+        times.push_back(forward.times[i]);
+        pans.push_back(forward.pans[i]);
+        tilts.push_back(forward.tilts[i]);
+    }
+
     if (times.size() < 2)
     {
-        sendMessage(OFX::Message::eMessageMessage, "", stop == eLost ? "Lost the subject straight away: make the box fit it more snugly and try again."
-                                                                   : "Tracking stopped straight away. Nothing was changed.");
+        const bool lost = backward.stop == eLost || forward.stop == eLost;
+        sendMessage(OFX::Message::eMessageMessage, "", lost ? "Lost the subject straight away: make the box fit it more snugly and try again."
+                                                            : "Tracking stopped straight away. Nothing was changed.");
         return;
     }
 
-    // Smooth out frame-to-frame jitter, then key every other frame (and the last one).
+    // Smooth out frame-to-frame jitter, then key every other frame (and both ends).
     const int radius = 3;
     std::vector<double> smoothPan(pans.size()), smoothTilt(tilts.size());
     for (size_t i = 0; i < pans.size(); ++i)
@@ -623,8 +677,8 @@ void StitchPlugin::trackSubject(double p_Time)
                 ++n;
             }
         }
-        smoothPan[i] = i == 0 ? pans[0] : sp / n;
-        smoothTilt[i] = i == 0 ? tilts[0] : st / n;
+        smoothPan[i] = i == startIndex ? pans[i] : sp / n;
+        smoothTilt[i] = i == startIndex ? tilts[i] : st / n;
     }
 
     beginEditBlock("Track Subject");
@@ -634,7 +688,7 @@ void StitchPlugin::trackSubject(double p_Time)
         for (int k = int(param->getNumKeys()) - 1; k >= 0; --k)
         {
             const double kt = param->getKeyTime(k);
-            if (kt >= p_Time && kt <= times.back())
+            if (kt >= times.front() && kt <= times.back())
             {
                 param->deleteKeyAtTime(kt);
             }
@@ -642,37 +696,52 @@ void StitchPlugin::trackSubject(double p_Time)
     }
     for (size_t i = 0; i < times.size(); ++i)
     {
-        if (i % 2 == 0 || i + 1 == times.size())
+        const long fromStart = long(i) - long(startIndex);
+        if (fromStart % 2 == 0 || i == 0 || i + 1 == times.size())
         {
-            m_Pan->setValueAtTime(times[i], i == 0 ? camPan : smoothPan[i] + offsetPan);
-            m_Tilt->setValueAtTime(times[i], i == 0 ? camTilt : fmin(fmax(smoothTilt[i] + offsetTilt, -90.0), 90.0));
+            m_Pan->setValueAtTime(times[i], i == startIndex ? camPan : smoothPan[i] + offsetPan);
+            m_Tilt->setValueAtTime(times[i], i == startIndex ? camTilt : fmin(fmax(smoothTilt[i] + offsetTilt, -90.0), 90.0));
         }
     }
     endEditBlock();
 
-    // Where tracking ended, as a time into the clip, so the user can find the spot again.
-    const double into = (times.back() - clipStart) / fps;
-    char at[32];
-    snprintf(at, sizeof(at), "%d:%02d", int(into) / 60, int(into) % 60);
-    char message[512];
-    switch (stop)
+    // What happened in each direction, with times into the clip so the user can find the spots.
+    auto describe = [&](const Pass& p_Pass, bool p_Forward) {
+        const double last = p_Pass.times.empty() ? p_Time : p_Pass.times.back();
+        const double into = (last - clipStart) / fps;
+        char at[32], line[256];
+        snprintf(at, sizeof(at), "%d:%02d", int(into) / 60, int(into) % 60);
+        const char* way = p_Forward ? "Forward" : "Backward";
+        switch (p_Pass.stop)
+        {
+        case eEnd:
+            snprintf(line, sizeof(line), "%s: tracked %s (%.1f s).", way,
+                     m_TrackToEnd->getValue() ? (p_Forward ? "to the end of the clip" : "to the start of the clip") : "for Track Length",
+                     (p_Pass.times.size() - 1) / fps);
+            break;
+        case eLost:
+            snprintf(line, sizeof(line), "%s: lost the subject at %s into the clip; the keyframes stop there.", way, at);
+            break;
+        case eCancelled:
+            snprintf(line, sizeof(line), "%s: stopped at %s into the clip.", way, at);
+            break;
+        case eNoFrame:
+            snprintf(line, sizeof(line), "%s: Resolve stopped providing frames at %s into the clip.", way, at);
+            break;
+        }
+        return std::string(line);
+    };
+    std::string message;
+    if (p_Directions & 2)
     {
-    case eEnd:
-        snprintf(message, sizeof(message), "Tracked to the end of the clip (%.1f s). If the view drifts somewhere, "
-                 "go there, put the box back on the subject and press Track Subject.", (times.size() - 1) / fps);
-        break;
-    case eLost:
-        snprintf(message, sizeof(message), "Lost the subject at %s into the clip; the keyframes stop there.\n"
-                 "Go to that moment, put the box back on the subject and press Track Subject to continue.", at);
-        break;
-    case eCancelled:
-        snprintf(message, sizeof(message), "Stopped at %s into the clip; the keyframes stop there.", at);
-        break;
-    case eNoFrame:
-        snprintf(message, sizeof(message), "Resolve stopped providing frames at %s into the clip; the keyframes stop there.", at);
-        break;
+        message += describe(backward, false) + "\n";
     }
-    LogOnce(std::string("track: ") + message);
+    if ((p_Directions & 1) && !(backward.stop == eCancelled && (p_Directions & 2)))
+    {
+        message += describe(forward, true) + "\n";
+    }
+    message += "If the view drifts, go to that moment, put the box back on the subject and track from there.";
+    LogOnce("track: " + message);
     sendMessage(OFX::Message::eMessageMessage, "", message);
 }
 
@@ -779,7 +848,15 @@ void StitchPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args, const st
 
     if (p_ParamName == kParamTrack)
     {
-        trackSubject(p_Args.time);
+        trackSubject(p_Args.time, 1);
+    }
+    else if (p_ParamName == kParamTrackBack)
+    {
+        trackSubject(p_Args.time, 2);
+    }
+    else if (p_ParamName == kParamTrackBoth)
+    {
+        trackSubject(p_Args.time, 3);
     }
     else if (p_ParamName == kParamDonate)
     {
@@ -1448,8 +1525,8 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
 
     OFX::GroupParamDescriptor* tracking = p_Desc.defineGroupParam("tracking");
     tracking->setLabels("Subject Tracking", "Subject Tracking", "Subject Tracking");
-    tracking->setHint("With the viewer in Open FX Overlay mode, drag the yellow box onto the subject and press Track Subject. "
-                      "The view follows it from this frame on, as Pan and Tilt keyframes, keeping it where the box is.");
+    tracking->setHint("With the viewer in Open FX Overlay mode, drag the yellow box onto the subject and press a Track button. "
+                      "The view follows it backward, forward or both ways from this frame, as Pan and Tilt keyframes, keeping it where the box is.");
 
     OFX::BooleanParamDescriptor* showBox = p_Desc.defineBooleanParam(kParamShowBox);
     showBox->setLabels("Show Subject Box", "Show Subject Box", "Show Subject Box");
@@ -1473,7 +1550,7 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
 
     OFX::DoubleParamDescriptor* trackLength = p_Desc.defineDoubleParam(kParamTrackLength);
     trackLength->setLabels("Track Length", "Track Length", "Track Length");
-    trackLength->setHint("How many seconds to track at most, from the current frame. Used when Until End of Clip is off.");
+    trackLength->setHint("How many seconds to track at most in each direction, from the current frame. Used when Until End of Clip is off.");
     trackLength->setDefault(10.0);
     trackLength->setRange(1.0, 600.0);
     trackLength->setDisplayRange(1.0, 60.0);
@@ -1511,11 +1588,21 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     tip->setParent(*tracking);
     page->addChild(*tip);
 
-    OFX::PushButtonParamDescriptor* track = p_Desc.definePushButtonParam(kParamTrack);
-    track->setLabels("Track Subject", "Track Subject", "Track Subject");
-    track->setHint("Follow the subject in the yellow box from this frame forward. Needs the viewer in Open FX Overlay mode.");
-    track->setParent(*tracking);
-    page->addChild(*track);
+    // Like Resolve's own tracker: backward, both ways, forward (stop with Cancel in the progress window).
+    struct TrackButton { const char* name; const char* label; const char* hint; };
+    const TrackButton buttons[] = {
+        {kParamTrackBack, "\xE2\x97\x80 Track Backward", "Follow the subject in the yellow box from this frame back towards the start."},
+        {kParamTrackBoth, "\xE2\x97\x80 Track Both Ways \xE2\x96\xB6", "Follow the subject in the yellow box back to the start and forward to the end."},
+        {kParamTrack, "Track Forward \xE2\x96\xB6", "Follow the subject in the yellow box from this frame forward."},
+    };
+    for (const TrackButton& b : buttons)
+    {
+        OFX::PushButtonParamDescriptor* track = p_Desc.definePushButtonParam(b.name);
+        track->setLabels(b.label, b.label, b.label);
+        track->setHint(std::string(b.hint) + " Needs the viewer in Open FX Overlay mode.");
+        track->setParent(*tracking);
+        page->addChild(*track);
+    }
 
     OFX::DoubleParamDescriptor* baseDistance = p_Desc.defineDoubleParam(kParamBaseDistance);
     baseDistance->setLabels("Base Distance", "Base Distance", "Base Distance");
