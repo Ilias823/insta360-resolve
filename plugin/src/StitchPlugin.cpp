@@ -82,9 +82,6 @@
 #define kFullResGiveUp 8     // frames that did not match the decoded file before an instance stops decoding
 #define kTagAttempts 30 // frames tried before deciding a clip has no tag (imported before tags existed)
 
-// The overlay counts as visible if the viewer drew it this recently.
-#define kOverlaySeenSeconds 3.0
-
 static double SecondsNow()
 {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -426,7 +423,9 @@ void StitchPlugin::trackSubject(double p_Time, int p_Directions)
         sendMessage(OFX::Message::eMessageMessage, "", "The yellow box is on now: put it on the subject and track again.");
         return;
     }
-    if (SecondsNow() - s_OverlayDrawn.load() > kOverlaySeenSeconds)
+    // Resolve redraws the on-screen controls only when something changes, so how long ago they
+    // were drawn says nothing; warn only if they have never been drawn since Resolve started.
+    if (s_OverlayDrawn.load() == 0.0)
     {
         sendMessage(OFX::Message::eMessageMessage, "",
                     "Turn on Open FX Overlay (viewer menu, bottom-left), drag the yellow box onto the subject, then track again.");
