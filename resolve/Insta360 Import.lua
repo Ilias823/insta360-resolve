@@ -166,6 +166,54 @@ local function addTagTrack(timeline, tagPath, start)
     return items, imported[1]
 end
 
+-- Diagnostics for layouts Resolve did not accept, in a file the user can send.
+local LOG = (os.getenv("HOME") or "/tmp") .. "/Library/Logs/Insta360Import.log"
+local function log(text)
+    local f = io.open(LOG, "a")
+    if f then
+        f:write(os.date("%Y-%m-%d %H:%M:%S  ") .. text .. "\n")
+        f:close()
+    end
+end
+
+-- Puts one lens on its half of the frame (see the comment in build) and checks that Resolve
+-- really applied it, trying the all-at-once form if the one-by-one form was not taken.
+local function placeLens(item, side, width)
+    local wanted = {Scaling = 4, ZoomGang = false, ZoomX = 0.5, ZoomY = 1.0, Pan = side * width / 4.0}
+    local function applied()
+        for key, value in pairs(wanted) do
+            local got = item:GetProperty(key)
+            if type(value) == "number" then
+                if type(got) ~= "number" or math.abs(got - value) > 1e-3 * math.max(1, math.abs(value)) then
+                    return false, key .. "=" .. tostring(got)
+                end
+            elseif got ~= value and not (value == false and (got == 0 or got == nil)) then
+                return false, key .. "=" .. tostring(got)
+            end
+        end
+        return true
+    end
+    for _, key in ipairs({"Scaling", "ZoomGang", "ZoomX", "ZoomY", "Pan"}) do
+        item:SetProperty(key, wanted[key])
+    end
+    local ok, problem = applied()
+    if not ok then
+        log("lens layout not taken one by one (" .. problem .. "); trying SetProperties")
+        local all = {RetimeAndScalingEnabled = true, TransformEnabled = true}
+        for key, value in pairs(wanted) do
+            all[key] = value
+        end
+        if item.SetProperties then
+            item:SetProperties(all)
+        end
+        ok, problem = applied()
+    end
+    if not ok then
+        log("lens layout rejected by Resolve " .. tostring(resolveApp:GetVersionString()) .. ": " .. problem)
+    end
+    return ok, problem
+end
+
 local function build(clip)
     local compoundName = clip.name .. " 360"
     for _, existing in ipairs(folder:GetClipList() or {}) do
@@ -210,11 +258,10 @@ local function build(clip)
     -- half its width and moved a quarter of the width to its side, so lens A fills the left half
     -- and lens B the right half in a timeline of any shape.
     for _, placed in ipairs({{itemA, -1}, {itemB, 1}}) do
-        placed[1]:SetProperty("Scaling", 4)
-        placed[1]:SetProperty("ZoomGang", false)
-        placed[1]:SetProperty("ZoomX", 0.5)
-        placed[1]:SetProperty("ZoomY", 1.0)
-        placed[1]:SetProperty("Pan", placed[2] * width / 4.0)
+        local ok, problem = placeLens(placed[1], placed[2], width)
+        if not ok then
+            return "FAILED: Resolve did not accept the lens layout (" .. problem .. "). Please send ~/Library/Logs/Insta360Import.log"
+        end
     end
     local tagItems, tagMedia = addTagTrack(timeline, clip.tag, start)
     local parts = {itemA, itemB}
