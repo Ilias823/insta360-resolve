@@ -179,7 +179,15 @@ end
 -- Puts one lens on its half of the frame (see the comment in build) and checks that Resolve
 -- really applied it, trying the all-at-once form if the one-by-one form was not taken.
 local function placeLens(item, side, width)
-    local wanted = {Scaling = 4, ZoomGang = false, ZoomX = 0.5, ZoomY = 1.0, Pan = side * width / 4.0}
+    -- Pan units differ between Macs (on one, 1920 moved a lens 3840 pixels). Resolve limits Pan
+    -- to 4 frame widths in its own units, so asking for far too much and reading back the limit
+    -- tells how many units a frame width is; a quarter width is a sixteenth of the limit.
+    item:SetProperty("Scaling", 4)
+    item:SetProperty("Pan", 1e9)
+    local limit = tonumber(item:GetProperty("Pan")) or 0
+    local quarter = limit > 0 and limit / 16.0 or width / 4.0
+    log(string.format("lens shift: Pan limit %s, frame width %d px, quarter width %.1f units", tostring(limit), width, quarter))
+    local wanted = {Scaling = 4, ZoomGang = false, ZoomX = 0.5, ZoomY = 1.0, Pan = side * quarter}
     local function applied()
         for key, value in pairs(wanted) do
             local got = item:GetProperty(key)

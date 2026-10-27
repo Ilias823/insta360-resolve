@@ -517,7 +517,11 @@ def build(project, lens_a, lens_b, info, name):
         item.SetProperty("ZoomGang", False)
         item.SetProperty("ZoomX", 0.5)
         item.SetProperty("ZoomY", 1.0)
-        item.SetProperty("Pan", side * width / 4.0)
+        # Pan units differ between Macs; Resolve limits Pan to 4 frame widths in its own units,
+        # so the limit read back after asking for far too much gives the unit (see the .lua).
+        item.SetProperty("Pan", 1e9)
+        limit = float(item.GetProperty("Pan") or 0)
+        item.SetProperty("Pan", side * (limit / 16.0 if limit > 0 else width / 4.0))
     tag_items = add_tag_track(pool, timeline, info.get("tag"), start)
     compound = timeline.CreateCompoundClip([item_a, item_b] + tag_items, {"name": compound_name})
     if compound is None:
