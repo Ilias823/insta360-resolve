@@ -496,6 +496,13 @@ def build(project, lens_a, lens_b, info, name):
         warning = (f" (WARNING: timeline is {timeline.GetSetting('timelineFrameRate')} fps, "
                    f"clip is {info['fps']} fps)")
 
+    # Resolve can make the timeline smaller than asked (seen on 21.1.2: half size); the lens
+    # shift below is worked out from the size it really has.
+    got_w, got_h = int(float(timeline.GetSetting("timelineResolutionWidth"))), int(float(timeline.GetSetting("timelineResolutionHeight")))
+    if got_w <= 0 or abs(got_w - 2 * got_h) > 2:
+        raise RuntimeError(f"{name}: Resolve would not make a 2:1 timeline (asked {width}x{height}, got {got_w}x{got_h})")
+    width, height = got_w, got_h
+
     timeline.AddTrack("video")
     start = timeline.GetStartFrame()
     item_a = pool.AppendToTimeline([{"mediaPoolItem": a, "trackIndex": 1, "recordFrame": start}])[0]

@@ -249,10 +249,13 @@ local function build(clip)
     local gotW, gotH = tonumber(timeline:GetSetting("timelineResolutionWidth")), tonumber(timeline:GetSetting("timelineResolutionHeight"))
     log(string.format("%s: Resolve %s, lenses %dx%d, working timeline asked %dx%d got %sx%s",
         clip.name, tostring(resolveApp:GetVersionString()), clip.width, clip.height, width, height, tostring(gotW), tostring(gotH)))
-    if gotW ~= width or gotH ~= height then
-        return string.format("FAILED: Resolve would not make a %dx%d timeline for the lenses (it made %sx%s). "
+    -- Resolve can make the timeline smaller than asked (seen on 21.1.2: half size). The layout
+    -- only needs it to be 2:1, and the lens shift is worked out from the size it really has.
+    if not gotW or not gotH or gotW <= 0 or math.abs(gotW - 2 * gotH) > 2 then
+        return string.format("FAILED: Resolve would not make a 2:1 timeline for the lenses (asked %dx%d, got %sx%s). "
             .. "Please send ~/Library/Logs/Insta360Import.log", width, height, tostring(gotW), tostring(gotH))
     end
+    width, height = gotW, gotH
 
     timeline:AddTrack("video")
     local start = timeline:GetStartFrame()
