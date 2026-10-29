@@ -50,6 +50,25 @@ pkgbuild --root "$root" --component-plist "$stage/components.plist" --scripts "$
     --identifier org.insta360resolve.stitch --version "$version" --install-location / \
     --ownership recommended "$stage/Insta360Stitch.pkg"
 
+# macOS tags every new file with a com.apple.provenance attribute that cannot be removed, and
+# pkgbuild stores it as "._" files, which would be installed too (into the plugin bundle and
+# next to the script in Resolve's Scripts folder). Repack the payload with cpio, which leaves
+# them out. The component settings above live in PackageInfo, which is kept.
+expanded="$stage/expanded"
+pkgutil --expand "$stage/Insta360Stitch.pkg" "$expanded"
+(cd "$root" && find . | sort | cpio -o --format odc -R 0:0 2>/dev/null | gzip -9 -c) > "$expanded/Payload"
+lsbom "$expanded/Bom" | grep -v '/\._' > "$stage/bom.txt"
+rm -f "$expanded/Bom"
+mkbom -i "$stage/bom.txt" "$expanded/Bom"
+files="$(cd "$root" && find . | wc -l | tr -d ' ')"
+sed -i '' -e "s/numberOfFiles=\"[0-9]*\"/numberOfFiles=\"$files\"/" "$expanded/PackageInfo"
+rm "$stage/Insta360Stitch.pkg"
+pkgutil --flatten "$expanded" "$stage/Insta360Stitch.pkg"
+if gunzip -dc "$expanded/Payload" | cpio -it 2>/dev/null | grep -q '/\._'; then
+    echo "the payload still has ._ files" >&2
+    exit 1
+fi
+
 sed -e "s|@VERSION@|$version|g" "$here/distribution.xml" > "$stage/distribution.xml"
 mkdir -p "$project/dist"
 productbuild --distribution "$stage/distribution.xml" --resources "$here/resources" --package-path "$stage" \
