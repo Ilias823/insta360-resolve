@@ -31,6 +31,8 @@
 #include "ofxCore.h"
 #include "Calibration.h"
 #include "LensDecoder.h"
+#include "Motion.h"
+#include "MotionBlur.h"
 #include "StitchKernel.h"
 #include "Tracker.h"
 
@@ -439,8 +441,187 @@ static int TrackFiles(int argc, char** argv)
     return 0;
 }
 
+// A whole stabilised frame with motion blur, as the plugin renders it.
+static int BlurFile(int argc, char** argv)
+{
+    if (argc != 11 && argc != 17)
+    {
+        fprintf(stderr, "usage: test_plugin --blur lensA.mov lensB.mov file.motion calibration.json|- frame width height amount out.raw [pan tilt roll fov distance aspect]\n");
+        return 2;
+    }
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    const auto motion = MotionData::Load(argv[4]);
+    std::string raw = kNominalX5Calibration;
+    LensCalibration lenses[2];
+    if ((strcmp(argv[5], "-") != 0 && !ReadCalibrationFile(argv[5], raw)) || !ParseCalibration(raw, lenses))
+    {
+        return 1;
+    }
+    const int frame = atoi(argv[6]), width = atoi(argv[7]), height = atoi(argv[8]);
+    const float amount = atof(argv[9]);
+
+    StitchParams base = {};
+    base.mode = argc == 17 ? eModeReframe : eModeStitch;
+    base.flipY = 1;
+    base.blendBand = float(sin(2.0 * M_PI / 180.0));
+    base.gainMatch = 1;
+    base.autoDistance = 1;
+    base.fullRes = 1;
+    base.trustDecoded = 1;
+    if (argc == 17)
+    {
+        FillViewParams(atof(argv[11]), atof(argv[12]), atof(argv[13]), atof(argv[14]), atof(argv[15]), atof(argv[16]), base);
+    }
+    FillLensOffset(lenses, base);
+    const auto setUp = [&](int p_Frame, int p_W, int p_H, LensImages& p_Images, StitchParams& p_Out)
+    {
+        if (p_Frame < 0 || !AcquireLensImages(queue, argv[2], argv[3], p_Frame, p_Images))
+        {
+            return false;
+        }
+        p_Out = base;
+        p_Out.width = p_W;
+        p_Out.height = p_H;
+        p_Out.lensWidth = p_Images.width;
+        p_Out.lensHeight = p_Images.height;
+        p_Out.seamLod = float(std::max(0.0, log2(p_Images.width / 960.0)));
+        p_Out.yuvScale = p_Images.bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f;
+        p_Out.chromaMid = p_Images.bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
+        FillLensParams(lenses, 2 * p_Images.width, p_Images.height, p_Out.lens);
+        if (motion)
+        {
+            double r[9];
+            motion->viewToCamera(p_Frame, 1, 1.0, true, r);
+            p_Out.stabilize = 1;
+            for (int i = 0; i < 9; ++i)
+            {
+                p_Out.stab[i] = float(r[i]);
+            }
+        }
+        return true;
+    };
+
+    LensImages images;
+    StitchParams params;
+    if (!setUp(frame, width, height, images, params))
+    {
+        return 1;
+    }
+    const NSUInteger bytes = NSUInteger(width) * height * 16;
+    id<MTLBuffer> src = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dst = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    RunStitchMetalKernel(queue, params, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst), &images);
+
+    double blurSeconds = 0.0;
+    if (amount > 0.0f)
+    {
+        int smallW, smallH;
+        MotionBlurSize(width, height, smallW, smallH);
+        StitchParams frames[3];
+        LensImages small[3];
+        bool have[3];
+        const double start = Seconds();
+        for (int i = 0; i < 3; ++i)
+        {
+            have[i] = setUp(frame + i - 1, smallW, smallH, small[i], frames[i]);
+        }
+        if (!RunMotionBlur(queue, width, height, base.mode == eModeStitch, amount, frames, small, have,
+                           reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst)))
+        {
+            fprintf(stderr, "motion blur failed\n");
+            return 1;
+        }
+        blurSeconds = Seconds() - start;
+    }
+    id<MTLCommandBuffer> sync = [queue commandBuffer];
+    [sync commit];
+    [sync waitUntilCompleted];
+    FILE* f = fopen(argv[10], "wb");
+    fwrite(dst.contents, 1, bytes, f);
+    fclose(f);
+    printf("frame %d: blur added %.0f ms\n", frame, blurSeconds * 1000.0);
+    return 0;
+}
+
+// Checks which way the flow points: moves a picture by a known amount.
+static void TestOpticalFlow(int w, int h, int dx, int dy)
+{
+    std::vector<unsigned char> a(size_t(w) * h * 4), b(size_t(w) * h * 4);
+    // Detail at many sizes that does not repeat, like a photograph.
+    std::vector<float> noise(size_t(w + 64) * (h + 64));
+    srand(7);
+    for (int size : {4, 8, 16, 32})
+    {
+        std::vector<float> cells(size_t((w + 64) / size + 2) * ((h + 64) / size + 2));
+        for (float& v : cells)
+        {
+            v = float(rand()) / RAND_MAX - 0.5f;
+        }
+        const int stride = (w + 64) / size + 2;
+        for (int y = 0; y < h + 64; ++y)
+        {
+            for (int x = 0; x < w + 64; ++x)
+            {
+                const float fx = float(x) / size, fy = float(y) / size;
+                const int ix = int(fx), iy = int(fy);
+                const float tx = fx - ix, ty = fy - iy;
+                noise[size_t(y) * (w + 64) + x] += 60.0f * ((1 - ty) * ((1 - tx) * cells[iy * stride + ix] + tx * cells[iy * stride + ix + 1]) +
+                                                            ty * ((1 - tx) * cells[(iy + 1) * stride + ix] + tx * cells[(iy + 1) * stride + ix + 1]));
+            }
+        }
+    }
+    const auto texture = [&](int x, int y) { return (unsigned char)std::min(255.0f, std::max(0.0f, 127.0f + noise[size_t(y + 32) * (w + 64) + x + 32])); };
+    for (int y = 0; y < h; ++y)
+    {
+        for (int x = 0; x < w; ++x)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                a[(size_t(y) * w + x) * 4 + c] = texture(x, y);
+                b[(size_t(y) * w + x) * 4 + c] = texture(x - dx, y - dy); // the picture moved by +dx, +dy rows
+            }
+            a[(size_t(y) * w + x) * 4 + 3] = b[(size_t(y) * w + x) * 4 + 3] = 255;
+        }
+    }
+    std::vector<float> flow;
+    int fw = 0, fh = 0;
+    const bool ok = OpticalFlow(a.data(), b.data(), w, h, flow, fw, fh);
+    double mx = 0.0, my = 0.0;
+    if (ok)
+    {
+        // The median over the middle of the picture.
+        std::vector<float> xs, ys;
+        for (int y = fh / 4; y < 3 * fh / 4; ++y)
+        {
+            for (int x = fw / 4; x < 3 * fw / 4; ++x)
+            {
+                xs.push_back(flow[(size_t(y) * fw + x) * 2] * w);
+                ys.push_back(flow[(size_t(y) * fw + x) * 2 + 1] * h);
+            }
+        }
+        std::nth_element(xs.begin(), xs.begin() + xs.size() / 2, xs.end());
+        std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+        mx = xs[xs.size() / 2];
+        my = ys[ys.size() / 2];
+    }
+    printf("     optical flow %dx%d: moved (%d, %d), measured (%.2f, %.2f)\n", fw, fh, dx, dy, mx, my);
+    Check(ok && fabs(mx - dx) < 1.5 && fabs(my - dy) < 1.5, "optical flow points from a frame to where its pixels go");
+}
+
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && strcmp(argv[1], "--flow") == 0)
+    {
+        TestOpticalFlow(640, 360, 12, -7);
+        TestOpticalFlow(640, 320, -20, 4);
+        TestOpticalFlow(360, 640, 5, 18);
+        return s_Failures;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--blur") == 0)
+    {
+        return BlurFile(argc, argv);
+    }
     if (argc >= 2 && strcmp(argv[1], "--track") == 0)
     {
         return TrackFiles(argc, argv);

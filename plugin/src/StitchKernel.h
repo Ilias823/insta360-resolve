@@ -54,6 +54,7 @@ struct StitchParams
     float seamLod;   // mip level the seam analysis reads, fullRes only
     float yuvScale;  // decoded texture value * yuvScale = code value / (2^bits - 1)
     float chromaMid; // zero chroma as code value / (2^bits - 1)
+    int trustDecoded; // 1 = use the decoded lenses without comparing them with the input, fullRes only
 };
 
 struct LensImages;
@@ -74,3 +75,7 @@ int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_
 // With p_Params.fullRes the lenses are read from p_Lenses instead of p_Input.
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output,
                           const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr);
+
+// Smears p_Output, in place, along the movement in two id<MTLTexture> of RG32Float (MotionBlur.h).
+// p_Wrap: the left and right edges meet, as in a 360 picture. Commits without waiting.
+bool RunBlurKernel(void* p_CmdQ, int p_Width, int p_Height, bool p_Wrap, float p_Amount, void* p_Previous, void* p_Next, float* p_Output);

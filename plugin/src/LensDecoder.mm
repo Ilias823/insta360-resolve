@@ -124,8 +124,10 @@ private:
                 return false;
             }
             [reader addOutput:output];
-            // Start half a frame early, so that rounding in the timestamps cannot skip the frame.
-            const CMTime at = CMTimeAdd(m_Start, CMTimeMultiplyByFloat64(m_FrameDuration, fmax(p_Frame - 0.5, 0.0)));
+            // Start inside the frame before: the reader first returns the frame the start falls in,
+            // stamped with the start time. Three quarters early rounds to that frame's number, where
+            // a half could round up to this frame's and pass the previous picture off as this one.
+            const CMTime at = CMTimeAdd(m_Start, CMTimeMultiplyByFloat64(m_FrameDuration, fmax(p_Frame - 0.75, 0.0)));
             reader.timeRange = CMTimeRangeMake(at, kCMTimePositiveInfinity);
             if (![reader startReading])
             {

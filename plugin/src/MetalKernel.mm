@@ -54,6 +54,7 @@ struct StitchParams
     float seamLod;
     float yuvScale;
     float chromaMid;
+    int trustDecoded;
 };
 
 // Where the lens pictures come from: Resolve's input buffer, or with fullRes the lens files
@@ -241,7 +242,15 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
     // is not always the frame in the file (in Fusion it counts from the start of the comp).
     // Both are compared at the input's resolution, inside the image circles.
     bool decoded = false;
-    if (p.fullRes != 0)
+    if (p.fullRes != 0 && p.trustDecoded != 0)
+    {
+        decoded = true;
+        if (tid == 0)
+        {
+            p_Table[SEAM_BINS + 1] = float4(1.0, 0.0, 0.0, 0.0);
+        }
+    }
+    else if (p.fullRes != 0)
     {
         const Source probe = {true, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
         const float2 size = LensSize(p);
@@ -551,6 +560,64 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
     p_Output[index + 3] = px.a;
 }
 // Brightness at the centres of the clip tag's 32 cells (positions computed on the CPU, ClipTag.h).
+struct BlurParams
+{
+    int width;
+    int height;
+    int wrap;
+    float amount;
+};
+
+static float4 ReadBlurPixel(const device float* p_Input, constant BlurParams& b, int p_X, int p_Y)
+{
+    const int x = b.wrap != 0 ? (p_X + b.width) % b.width : clamp(p_X, 0, b.width - 1);
+    const int y = clamp(p_Y, 0, b.height - 1);
+    const int i = (y * b.width + x) * 4;
+    return float4(p_Input[i], p_Input[i + 1], p_Input[i + 2], p_Input[i + 3]);
+}
+
+static float4 ReadBlurBilinear(const device float* p_Input, constant BlurParams& b, float2 p_Pos)
+{
+    const float2 base = floor(p_Pos);
+    const float2 f = p_Pos - base;
+    const int x = int(base.x), y = int(base.y);
+    return mix(mix(ReadBlurPixel(p_Input, b, x, y), ReadBlurPixel(p_Input, b, x + 1, y), f.x),
+               mix(ReadBlurPixel(p_Input, b, x, y + 1), ReadBlurPixel(p_Input, b, x + 1, y + 1), f.x), f.y);
+}
+
+// Averages the picture along the path each pixel takes, half towards the previous frame and half
+// towards the next.
+kernel void BlurKernel(constant BlurParams& b [[buffer(1)]],
+                       const device float* p_Input [[buffer(0)]],
+                       device float* p_Output [[buffer(8)]],
+                       texture2d<float> p_Previous [[texture(0)]],
+                       texture2d<float> p_Next [[texture(1)]],
+                       uint2 id [[thread_position_in_grid]])
+{
+    if (id.x >= uint(b.width) || id.y >= uint(b.height))
+    {
+        return;
+    }
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    const float2 size = float2(float(b.width), float(b.height));
+    const float2 uv = (float2(id) + 0.5) / size;
+    const float2 back = p_Previous.sample(s, uv).xy * size * 0.5 * b.amount;
+    const float2 ahead = p_Next.sample(s, uv).xy * size * 0.5 * b.amount;
+    const int samples = clamp(int(length(back) + length(ahead)), 1, 48);
+    float4 sum = float4(0.0);
+    for (int i = 0; i < samples; ++i)
+    {
+        const float t = (float(i) + 0.5) / float(samples) * 2.0 - 1.0;
+        sum += ReadBlurBilinear(p_Input, b, float2(id) + (t < 0.0 ? -t * back : t * ahead));
+    }
+    sum /= float(samples);
+    const int index = (int(id.y) * b.width + int(id.x)) * 4;
+    p_Output[index] = sum.r;
+    p_Output[index + 1] = sum.g;
+    p_Output[index + 2] = sum.b;
+    p_Output[index + 3] = sum.a;
+}
+
 kernel void TagKernel(constant StitchParams& p [[buffer(1)]],
                       const device float* p_Input [[buffer(0)]],
                       constant int2* p_Cells [[buffer(2)]],
@@ -573,6 +640,7 @@ struct Pipelines
     id<MTLComputePipelineState> stitch;
     id<MTLComputePipelineState> seam;
     id<MTLComputePipelineState> tag;
+    id<MTLComputePipelineState> blur;
     id<MTLTexture> placeholder; // bound in place of the decoded lenses when they are not used
 };
 
@@ -608,20 +676,21 @@ static Pipelines PipelinesForQueue(id<MTLCommandQueue> p_Queue)
     if (!library)
     {
         fprintf(stderr, "Insta360Stitch: Metal library failed to build: %s\n", err.localizedDescription.UTF8String);
-        return Pipelines{nil, nil, nil, nil};
+        return Pipelines{};
     }
 
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:1 height:1 mipmapped:NO];
-    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel"),
+    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel"), BuildPipeline(library, @"BlurKernel"),
                            [device newTextureWithDescriptor:desc]};
     [library release];
-    if (!pipelines.stitch || !pipelines.seam || !pipelines.tag)
+    if (!pipelines.stitch || !pipelines.seam || !pipelines.tag || !pipelines.blur)
     {
         [pipelines.stitch release];
         [pipelines.seam release];
         [pipelines.tag release];
+        [pipelines.blur release];
         [pipelines.placeholder release];
-        return Pipelines{nil, nil, nil, nil};
+        return Pipelines{};
     }
 
     s_Pipelines[(void*)p_Queue] = pipelines;
@@ -659,6 +728,44 @@ int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_
     memcpy(brightness, out.contents, sizeof(brightness));
     [out release];
     return ClipTag::Decode(brightness);
+}
+
+bool RunBlurKernel(void* p_CmdQ, int p_Width, int p_Height, bool p_Wrap, float p_Amount, void* p_Previous, void* p_Next, float* p_Output)
+{
+    id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(p_CmdQ);
+    const Pipelines pipelines = PipelinesForQueue(queue);
+    if (!pipelines.blur)
+    {
+        return false;
+    }
+    id<MTLBuffer> dstBuf = reinterpret_cast<id<MTLBuffer>>(p_Output);
+    const NSUInteger bytes = NSUInteger(p_Width) * p_Height * 16;
+    id<MTLBuffer> copy = [queue.device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    commandBuffer.label = @"Insta360Stitch blur";
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    [blit copyFromBuffer:dstBuf sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
+    [blit endEncoding];
+
+    struct
+    {
+        int width, height, wrap;
+        float amount;
+    } params = {p_Width, p_Height, p_Wrap ? 1 : 0, p_Amount};
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipelines.blur];
+    [encoder setBuffer:copy offset:0 atIndex:0];
+    [encoder setBytes:&params length:sizeof(params) atIndex:1];
+    [encoder setBuffer:dstBuf offset:0 atIndex:8];
+    [encoder setTexture:static_cast<id<MTLTexture>>(p_Previous) atIndex:0];
+    [encoder setTexture:static_cast<id<MTLTexture>>(p_Next) atIndex:1];
+    const NSUInteger exeWidth = pipelines.blur.threadExecutionWidth;
+    [encoder dispatchThreadgroups:MTLSizeMake((p_Width + exeWidth - 1) / exeWidth, p_Height, 1) threadsPerThreadgroup:MTLSizeMake(exeWidth, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [copy release];
+    return true;
 }
 
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output, const LensImages* p_Lenses,

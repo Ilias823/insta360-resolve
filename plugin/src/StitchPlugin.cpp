@@ -31,6 +31,7 @@
 #include "ProgressWindow.h"
 #include "ClipTag.h"
 #include "Motion.h"
+#include "MotionBlur.h"
 #include "Registry.h"
 #include "Tracker.h"
 #include "Updater.h"
@@ -77,6 +78,7 @@
 #define kParamStabilize "stabilization"
 #define kParamSmoothness "smoothness"
 #define kParamLevel "levelHorizon"
+#define kParamMotionBlur "motionBlur"
 #define kParamFullRes "fullResolution"
 #define kFullResMinSize 480 // smaller renders, such as thumbnails, use Resolve's picture
 #define kFullResGiveUp 8     // frames that did not match the decoded file before an instance stops decoding
@@ -255,6 +257,7 @@ private:
     OFX::ChoiceParam* m_Stabilize;
     OFX::DoubleParam* m_Smoothness;
     OFX::BooleanParam* m_Level;
+    OFX::DoubleParam* m_MotionBlur;
     OFX::BooleanParam* m_FullRes;
     std::shared_ptr<FullResCheck> m_FullResCheck = std::make_shared<FullResCheck>();
     std::atomic<int> m_ClipId{0};
@@ -293,6 +296,7 @@ StitchPlugin::StitchPlugin(OfxImageEffectHandle p_Handle)
     m_BaseDistance = fetchDoubleParam(kParamBaseDistance);
     m_Stabilize = fetchChoiceParam(kParamStabilize);
     m_Smoothness = fetchDoubleParam(kParamSmoothness);
+    m_MotionBlur = fetchDoubleParam(kParamMotionBlur);
     m_Level = fetchBooleanParam(kParamLevel);
     m_FullRes = fetchBooleanParam(kParamFullRes);
 }
@@ -976,26 +980,32 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     {
         noteTag(ReadClipTagMetal(p_Args.pMetalCmdQ, params, static_cast<const float*>(src->getPixelData())));
     }
-    double stab[9];
-    if ((params.mode == eModeStitch || params.mode == eModeReframe) && stabilization(p_Args.time, stab))
+    // Where the view looks at a given time, which the neighbouring frames need too for motion blur.
+    const auto aim = [&](double p_Time, StitchParams& p_Out)
     {
-        params.stabilize = 1;
-        for (int i = 0; i < 9; ++i)
+        double stab[9];
+        p_Out.stabilize = 0;
+        if ((p_Out.mode == eModeStitch || p_Out.mode == eModeReframe) && stabilization(p_Time, stab))
         {
-            params.stab[i] = float(stab[i]);
+            p_Out.stabilize = 1;
+            for (int i = 0; i < 9; ++i)
+            {
+                p_Out.stab[i] = float(stab[i]);
+            }
         }
-    }
+        if (p_Out.mode == eModeReframe)
+        {
+            // The buffer can be squeezed (thumbnails are), so the shape of the view comes from the clip.
+            const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
+            const double aspect = (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : double(params.width) / params.height;
+            double fov, distance;
+            viewLens(p_Time, fov, distance);
+            FillViewParams(m_Pan->getValueAtTime(p_Time), m_Tilt->getValueAtTime(p_Time), m_Roll->getValueAtTime(p_Time),
+                           fov, distance, aspect, p_Out);
+        }
+    };
+    aim(p_Args.time, params);
 
-    if (params.mode == eModeReframe)
-    {
-        // The buffer can be squeezed (thumbnails are), so the shape of the view comes from the clip.
-        const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
-        const double aspect = (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : double(params.width) / params.height;
-        double fov, distance;
-        viewLens(p_Args.time, fov, distance);
-        FillViewParams(m_Pan->getValueAtTime(p_Args.time), m_Tilt->getValueAtTime(p_Args.time), m_Roll->getValueAtTime(p_Args.time),
-                       fov, distance, aspect, params);
-    }
     params.blendBand = float(sin(m_BlendWidth->getValueAtTime(p_Args.time) * 0.5 * M_PI / 180.0));
     params.gainMatch = m_GainMatch->getValueAtTime(p_Args.time) ? 1 : 0;
     params.autoDistance = m_AutoDistance->getValueAtTime(p_Args.time) ? 1 : 0;
@@ -1062,6 +1072,44 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     processor.setGPURenderArgs(p_Args);
     processor.setRenderWindow(p_Args.renderWindow);
     processor.process();
+
+    const double blur = m_MotionBlur->getValueAtTime(p_Args.time);
+    if (blur > 0.0 && (params.mode == eModeStitch || params.mode == eModeReframe) && !neverMatched &&
+        p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ && clipId() > 0)
+    {
+        const ClipFiles files = clipFiles();
+        StitchParams frames[3];
+        LensImages images[3];
+        bool have[3];
+        int smallW, smallH;
+        MotionBlurSize(params.width, params.height, smallW, smallH);
+        for (int i = 0; i < 3; ++i)
+        {
+            const double time = p_Args.time + i - 1;
+            have[i] = !files.lensA.empty() && !files.lensB.empty() && time >= 0.0 &&
+                      AcquireLensImages(p_Args.pMetalCmdQ, files.lensA, files.lensB, int(lround(time)), images[i]);
+            if (have[i])
+            {
+                frames[i] = params;
+                frames[i].width = smallW;
+                frames[i].height = smallH;
+                frames[i].fullRes = 1;
+                frames[i].trustDecoded = 1;
+                frames[i].lensWidth = images[i].width;
+                frames[i].lensHeight = images[i].height;
+                frames[i].seamLod = float(std::max(0.0, log2(images[i].width / 960.0)));
+                frames[i].yuvScale = images[i].bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f;
+                frames[i].chromaMid = images[i].bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
+                FillLensParams(lenses, 2 * images[i].width, images[i].height, frames[i].lens);
+                aim(time, frames[i]);
+            }
+        }
+        if (!RunMotionBlur(p_Args.pMetalCmdQ, params.width, params.height, params.mode == eModeStitch, float(blur / 100.0), frames, images, have,
+                           static_cast<const float*>(src->getPixelData()), static_cast<float*>(dst->getPixelData())))
+        {
+            LogOnce("motion blur: skipped, the neighbouring frames could not be read from the lens files");
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1474,6 +1522,18 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     level->setAnimates(false);
     level->setParent(*stabilize);
     page->addChild(*level);
+
+    OFX::DoubleParamDescriptor* motionBlur = p_Desc.defineDoubleParam(kParamMotionBlur);
+    motionBlur->setLabels("Motion Blur", "Motion Blur", "Motion Blur");
+    motionBlur->setHint("Streaks like a long exposure, for hyperlapses and sped-up clips. 50 is like a film camera's shutter; 100 "
+                        "smears each frame half way to the next and previous ones. It takes extra time per frame, so leave it "
+                        "at 0 until the edit is done. Needs the clip's lens files.");
+    motionBlur->setDefault(0.0);
+    motionBlur->setRange(0.0, 200.0);
+    motionBlur->setDisplayRange(0.0, 200.0);
+    motionBlur->setIncrement(5.0);
+    motionBlur->setParent(*stabilize);
+    page->addChild(*motionBlur);
 
     OFX::GroupParamDescriptor* reframe = p_Desc.defineGroupParam("reframe");
     reframe->setLabels("Reframe", "Reframe", "Reframe");

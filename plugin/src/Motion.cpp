@@ -96,6 +96,11 @@ std::shared_ptr<const MotionData> MotionData::Load(const std::string& p_Path)
                 memcpy(&data->m_Quats[i * 4], &values[i * 7], 4 * sizeof(float));
                 memcpy(&data->m_Up[i * 3], &values[i * 7 + 4], 3 * sizeof(float));
             }
+            float speed = 0.0f; // after the frames, in files from sped-up clips
+            if (file.read(reinterpret_cast<char*>(&speed), 4) && speed > 1.0f)
+            {
+                data->m_Speed = speed;
+            }
         }
     }
     cache[p_Path] = data;
@@ -137,7 +142,7 @@ void MotionData::viewToCamera(double p_Frame, int p_Mode, double p_Smoothness, b
     else
     {
         // Smooth: the camera's direction averaged over a window, weighted towards the middle.
-        const int half = std::max(0, int(p_Smoothness * m_Fps));
+        const int half = std::max(0, int(p_Smoothness * m_Fps * std::min(sqrt(m_Speed), 4.0)));
         const double sigma = std::max(1.0, half / 2.0);
         double forward[3] = {0, 0, 0}, down[3] = {0, 0, 0};
         for (int j = std::max(0, k - half); j <= std::min(n - 1, k + half); ++j)

@@ -11,6 +11,7 @@ Free and open source. If it saves you time, you can support its development on *
 - **Reframe**: pan, tilt, roll, field of view and distance, with Insta360 Studio-style looks (Tiny Planet, Mega View, Ultra Wide, Dewarp, Linear). Works in timelines of any shape, including vertical. **Remove Distortion** keeps straight lines straight, like Insta360's linear view.
 - **Full resolution**: reads the lenses straight from the clip's own files (Apple's hardware decoder), so reframed views are as sharp as Insta360 Studio's in any timeline size, even a vertical 1080x1920 one where Resolve passes on only 540 pixels per lens. Falls back to Resolve's picture when the file is missing or does not match the frame (for example inside a Fusion comp). Can be turned off in the controls.
 - **Stabilization**: from the camera's own motion sensor, like Insta360's FlowState: Smooth (follows your camera moves), Locked Direction, and Level Horizon. Needs clips imported with version 0.2 or later.
+- **Hyperlapse**: stabilization follows each frame's real capture time, and smooths more on sped-up clips. Motion Blur adds long-exposure streaks (try 50); it adds time per frame, so turn it on when the edit is done. Re-import clips made with earlier versions.
 - **On-screen controls**: drag the picture to aim, drag the zoom bar to zoom (viewer set to *Open FX Overlay*).
 - **Subject tracking**: put the box on a subject and press Track Subject; the view follows it as Pan/Tilt keyframes.
 - **Updates**: About > Check for Updates looks for new releases here.
