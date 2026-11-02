@@ -83,6 +83,7 @@
 #define kFullResMinSize 480 // smaller renders, such as thumbnails, use Resolve's picture
 #define kFullResGiveUp 8     // frames that did not match the decoded file before an instance stops decoding
 #define kTagAttempts 30 // frames tried before deciding a clip has no tag (imported before tags existed)
+#define kTagRetryEvery 30 // frames between further looks after that
 
 static double SecondsNow()
 {
@@ -262,6 +263,7 @@ private:
     std::shared_ptr<FullResCheck> m_FullResCheck = std::make_shared<FullResCheck>();
     std::atomic<int> m_ClipId{0};
     std::atomic<int> m_TagAttempts{0};
+    std::atomic<int> m_TagRetries{0};
     std::mutex m_ClipMutex;
     ClipFiles m_ClipFiles;
     bool m_ClipFilesRead = false;
@@ -976,7 +978,10 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     params.mode = kViewModes[view >= 0 && view < 4 ? view : 0];
 
     // Which clip this is, from the tag the import put in its corners (read once, on the GPU).
-    if (clipId() == 0 && p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ)
+    // Frames too small to read it from, like thumbnails, can use up the attempts before a real one
+    // comes, so a clip taken to have no tag is still looked at now and then.
+    const bool retryTag = clipId() < 0 && ++m_TagRetries % kTagRetryEvery == 0;
+    if ((clipId() == 0 || retryTag) && p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ)
     {
         noteTag(ReadClipTagMetal(p_Args.pMetalCmdQ, params, static_cast<const float*>(src->getPixelData())));
     }

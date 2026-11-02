@@ -32,6 +32,7 @@
 #include "Calibration.h"
 #include "LensDecoder.h"
 #include "Motion.h"
+#include <unistd.h>
 #include "MotionBlur.h"
 #include "StitchKernel.h"
 #include "Tracker.h"
@@ -544,6 +545,35 @@ static int BlurFile(int argc, char** argv)
     return 0;
 }
 
+// A clip imported again while Resolve is open rewrites its motion file.
+static void TestMotionReload()
+{
+    char path[] = "/tmp/insta360_motion_XXXXXX";
+    close(mkstemp(path));
+    const auto write = [&](float p_Speed)
+    {
+        FILE* f = fopen(path, "wb");
+        const uint32_t count = 1;
+        const float fps = 30.0f, frame[7] = {1, 0, 0, 0, 0, -1, 0};
+        fwrite("I360MOT1", 1, 8, f);
+        fwrite(&count, 4, 1, f);
+        fwrite(&fps, 4, 1, f);
+        fwrite(frame, 4, 7, f);
+        if (p_Speed > 0.0f)
+        {
+            fwrite(&p_Speed, 4, 1, f);
+        }
+        fclose(f);
+    };
+    write(0.0f);
+    const auto before = MotionData::Load(path);
+    const bool same = before && MotionData::Load(path) == before;
+    write(10.0f);
+    const auto after = MotionData::Load(path);
+    Check(same && before->speed() == 1.0 && after && after->speed() == 10.0f, "a rewritten motion file is read again");
+    unlink(path);
+}
+
 // Checks which way the flow points: moves a picture by a known amount.
 static void TestOpticalFlow(int w, int h, int dx, int dy)
 {
@@ -613,6 +643,7 @@ int main(int argc, char** argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--flow") == 0)
     {
+        TestMotionReload();
         TestOpticalFlow(640, 360, 12, -7);
         TestOpticalFlow(640, 320, -20, 4);
         TestOpticalFlow(360, 640, 5, 18);

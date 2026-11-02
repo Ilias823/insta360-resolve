@@ -5,6 +5,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <sys/stat.h>
 
 namespace
 {
@@ -67,13 +68,23 @@ Mat RotationBetween(const double a[3], const double b[3])
 std::shared_ptr<const MotionData> MotionData::Load(const std::string& p_Path)
 {
     static std::mutex mutex;
-    static std::map<std::string, std::shared_ptr<const MotionData>> cache;
+    struct Entry
+    {
+        time_t modified;
+        off_t size;
+        std::shared_ptr<const MotionData> data;
+    };
+    static std::map<std::string, Entry> cache;
+
+    // Importing a clip again rewrites its file while Resolve is open, so check that it is the same one.
+    struct stat info = {};
+    const bool exists = stat(p_Path.c_str(), &info) == 0;
 
     std::lock_guard<std::mutex> lock(mutex);
     const auto it = cache.find(p_Path);
-    if (it != cache.end())
+    if (it != cache.end() && exists && it->second.modified == info.st_mtime && it->second.size == info.st_size)
     {
-        return it->second;
+        return it->second.data;
     }
 
     std::shared_ptr<MotionData> data;
@@ -103,7 +114,7 @@ std::shared_ptr<const MotionData> MotionData::Load(const std::string& p_Path)
             }
         }
     }
-    cache[p_Path] = data;
+    cache[p_Path] = Entry{info.st_mtime, info.st_size, data};
     return data;
 }
 
