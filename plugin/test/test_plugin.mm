@@ -810,6 +810,39 @@ int main(int argc, char** argv)
         Check(fabs(rayPan - 40.0) < 1e-6 && fabs(rayTilt + 25.0) < 1e-6, "view centre ray points along pan and tilt");
         ViewPointToRay(view, 0.9, 0.5, ray);
         Check(atan2(ray[0], ray[2]) * 180.0 / M_PI > 40.0, "a point right of centre lies further right");
+
+        // The seam line on the viewer: its points, taken back through the view maths and the
+        // stabilisation as the kernel does, must lie on the seam (or the line beside it).
+        StitchParams seamView = {};
+        FillViewParams(85.0, 10.0, 5.0, 110.0, 0.25, 9.0 / 16.0, seamView);
+        double stab[9];
+        ViewRotation(20.0, -10.0, 5.0, stab);
+        seamView.stabilize = 1;
+        for (int i = 0; i < 9; ++i)
+        {
+            seamView.stab[i] = float(stab[i]);
+        }
+        for (double offset : {0.0, 2.0})
+        {
+            double worst = 0.0;
+            int points = 0;
+            for (const auto& piece : SeamInView(seamView, offset))
+            {
+                for (const ViewPoint& point : piece)
+                {
+                    ViewPointToRay(seamView, point.u, point.v, ray);
+                    const double z = (stab[6] * ray[0] + stab[7] * ray[1] + stab[8] * ray[2]) /
+                                     sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+                    worst = fmax(worst, fabs(z - sin(offset * M_PI / 180.0)));
+                    ++points;
+                }
+            }
+            printf("      seam line %.0f degrees beside the seam: %d points, worst error %.2g\n", offset, points, worst);
+            Check(points > 50 && worst < 1e-4, offset == 0.0 ? "seam line lies on the seam" : "blend edge line lies beside the seam");
+        }
+        FillViewParams(0.0, 0.0, 0.0, 60.0, 0.0, 16.0 / 9.0, seamView);
+        seamView.stabilize = 0;
+        Check(SeamInView(seamView, 0.0).empty(), "no seam line when looking straight through lens A");
     }
 
     printf("%s\n", s_Failures ? "FAILED" : "all checks passed");

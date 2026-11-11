@@ -146,6 +146,63 @@ void FillViewParams(double p_Pan, double p_Tilt, double p_Roll, double p_Fov, do
     }
 }
 
+std::vector<std::vector<ViewPoint>> SeamInView(const StitchParams& p_Params, double p_OffsetDeg)
+{
+    // Points around the seam circle (z = sin(offset) in the camera frame), turned into the view:
+    // the kernel takes a view ray v to the camera as S v (stabilisation) and an image plane
+    // point to the view as R c, so the camera direction c gives R^T S^T c. The plane point is
+    // then c.xy / (c.z + distance), the inverse of the kernel's projection.
+    const int kSteps = 1440;
+    const double margin = 0.02; // a little past the frame edge, so lines reach it
+    const double z = sin(p_OffsetDeg * M_PI / 180.0), s = sqrt(fmax(1.0 - z * z, 0.0));
+    std::vector<std::vector<ViewPoint>> pieces(1);
+    ViewPoint last = {0.0, 0.0};
+    for (int i = 0; i <= kSteps; ++i)
+    {
+        const double phi = i * 2.0 * M_PI / kSteps;
+        const double camera[3] = {s * cos(phi), s * sin(phi), z};
+        double view[3], cam[3];
+        for (int r = 0; r < 3; ++r)
+        {
+            view[r] = p_Params.stabilize != 0
+                          ? p_Params.stab[r] * camera[0] + p_Params.stab[3 + r] * camera[1] + p_Params.stab[6 + r] * camera[2]
+                          : camera[r];
+        }
+        for (int r = 0; r < 3; ++r)
+        {
+            cam[r] = p_Params.camRot[r] * view[0] + p_Params.camRot[3 + r] * view[1] + p_Params.camRot[6 + r] * view[2];
+        }
+        const double den = cam[2] + p_Params.distance;
+        bool inside = den > 1e-4;
+        ViewPoint point = {0.0, 0.0};
+        if (inside)
+        {
+            point = {(cam[0] / den / p_Params.planeX + 1.0) * 0.5, (cam[1] / den / p_Params.planeY + 1.0) * 0.5};
+            inside = point.u > -margin && point.u < 1.0 + margin && point.v > -margin && point.v < 1.0 + margin;
+        }
+        // A new piece where the line leaves the frame or jumps (behind the camera).
+        const bool jump = !pieces.back().empty() && (fabs(point.u - last.u) > 0.25 || fabs(point.v - last.v) > 0.25);
+        if ((!inside || jump) && !pieces.back().empty())
+        {
+            pieces.emplace_back();
+        }
+        if (inside)
+        {
+            pieces.back().push_back(point);
+            last = point;
+        }
+    }
+    std::vector<std::vector<ViewPoint>> out;
+    for (auto& piece : pieces)
+    {
+        if (piece.size() >= 2)
+        {
+            out.push_back(std::move(piece));
+        }
+    }
+    return out;
+}
+
 void ViewPointToRay(const StitchParams& p_Params, double p_U, double p_V, double p_Ray[3])
 {
     const double px = (p_U * 2.0 - 1.0) * p_Params.planeX;

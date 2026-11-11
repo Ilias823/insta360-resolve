@@ -80,6 +80,7 @@
 #define kParamLevel "levelHorizon"
 #define kParamMotionBlur "motionBlur"
 #define kParamFullRes "fullResolution"
+#define kParamShowSeam "showSeam"
 #define kFullResMinSize 480 // smaller renders, such as thumbnails, use Resolve's picture
 #define kFullResGiveUp 8     // frames that did not match the decoded file before an instance stops decoding
 #define kTagAttempts 30 // frames tried before deciding a clip has no tag (imported before tags existed)
@@ -202,6 +203,10 @@ public:
 
     void render(const OFX::RenderArguments& p_Args) override;
     void changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName) override;
+
+    // The camera of a frame as render sets it up: stabilisation, and for Reframe the view.
+    // p_Params.mode must be set; p_Aspect is the frame's width / height.
+    void aimView(double p_Time, double p_Aspect, StitchParams& p_Params);
 
 private:
     void applyStyle(int p_Style);
@@ -933,6 +938,27 @@ void StitchPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args, const st
     }
 }
 
+void StitchPlugin::aimView(double p_Time, double p_Aspect, StitchParams& p_Params)
+{
+    double stab[9];
+    p_Params.stabilize = 0;
+    if ((p_Params.mode == eModeStitch || p_Params.mode == eModeReframe) && stabilization(p_Time, stab))
+    {
+        p_Params.stabilize = 1;
+        for (int i = 0; i < 9; ++i)
+        {
+            p_Params.stab[i] = float(stab[i]);
+        }
+    }
+    if (p_Params.mode == eModeReframe)
+    {
+        double fov, distance;
+        viewLens(p_Time, fov, distance);
+        FillViewParams(m_Pan->getValueAtTime(p_Time), m_Tilt->getValueAtTime(p_Time), m_Roll->getValueAtTime(p_Time),
+                       fov, distance, p_Aspect, p_Params);
+    }
+}
+
 void StitchPlugin::render(const OFX::RenderArguments& p_Args)
 {
     if ((m_DstClip->getPixelDepth() != OFX::eBitDepthFloat) || (m_DstClip->getPixelComponents() != OFX::ePixelComponentRGBA))
@@ -988,29 +1014,10 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         noteTag(ReadClipTagMetal(p_Args.pMetalCmdQ, params, static_cast<const float*>(src->getPixelData())));
     }
     // Where the view looks at a given time, which the neighbouring frames need too for motion blur.
-    const auto aim = [&](double p_Time, StitchParams& p_Out)
-    {
-        double stab[9];
-        p_Out.stabilize = 0;
-        if ((p_Out.mode == eModeStitch || p_Out.mode == eModeReframe) && stabilization(p_Time, stab))
-        {
-            p_Out.stabilize = 1;
-            for (int i = 0; i < 9; ++i)
-            {
-                p_Out.stab[i] = float(stab[i]);
-            }
-        }
-        if (p_Out.mode == eModeReframe)
-        {
-            // The buffer can be squeezed (thumbnails are), so the shape of the view comes from the clip.
-            const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
-            const double aspect = (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : double(params.width) / params.height;
-            double fov, distance;
-            viewLens(p_Time, fov, distance);
-            FillViewParams(m_Pan->getValueAtTime(p_Time), m_Tilt->getValueAtTime(p_Time), m_Roll->getValueAtTime(p_Time),
-                           fov, distance, aspect, p_Out);
-        }
-    };
+    // The buffer can be squeezed (thumbnails are), so the shape of the view comes from the clip.
+    const double rodW = rod.x2 - rod.x1, rodH = rod.y2 - rod.y1;
+    const double aspect = (rodW > 0.0 && rodH > 0.0) ? rodW / rodH : double(params.width) / params.height;
+    const auto aim = [&](double p_Time, StitchParams& p_Out) { aimView(p_Time, aspect, p_Out); };
     aim(p_Args.time, params);
 
     params.blendBand = float(sin(m_BlendWidth->getValueAtTime(p_Args.time) * 0.5 * M_PI / 180.0));
@@ -1153,6 +1160,8 @@ public:
         m_NoDistortion = p_Effect->fetchBooleanParam(kParamNoDistortion);
         m_BoxX = p_Effect->fetchDoubleParam(kParamBoxX);
         m_BoxY = p_Effect->fetchDoubleParam(kParamBoxY);
+        m_ShowSeam = p_Effect->fetchBooleanParam(kParamShowSeam);
+        m_Blend = p_Effect->fetchDoubleParam(kParamBlend);
         m_Effect = p_Effect;
     }
 
@@ -1214,6 +1223,8 @@ private:
                 0.5 * m_SubjectSize->getValueAtTime(p_Time) / 100.0 * fmax(w, h)};
     }
 
+    void drawSeam(OfxDrawContextHandle p_Context, const Layout& p_Layout, double p_Time);
+
     void setFovFromPen(const Layout& p_Layout, double p_Y, double p_Time)
     {
         // Top of the track is zoomed in (narrow view), bottom is zoomed out.
@@ -1235,6 +1246,8 @@ private:
     OFX::BooleanParam* m_NoDistortion;
     OFX::DoubleParam* m_BoxX;
     OFX::DoubleParam* m_BoxY;
+    OFX::BooleanParam* m_ShowSeam;
+    OFX::DoubleParam* m_Blend;
     Drag m_Drag;
     OfxPointD m_Last;
 };
@@ -1248,6 +1261,52 @@ static void DrawDisc(OfxDrawContextHandle p_Context, double p_X, double p_Y, dou
         points[i] = {p_X + p_Rx * cos(a), p_Y + p_Ry * sin(a)};
     }
     OFX::Private::gDrawSuite->draw(p_Context, kOfxDrawPrimitivePolygon, points, 32);
+}
+
+void ReframeInteract::drawSeam(OfxDrawContextHandle p_Context, const Layout& p_Layout, double p_Time)
+{
+    StitchPlugin* plugin = dynamic_cast<StitchPlugin*>(m_Effect);
+    if (!plugin)
+    {
+        return;
+    }
+    const double w = p_Layout.frame.x2 - p_Layout.frame.x1, h = p_Layout.frame.y2 - p_Layout.frame.y1;
+    StitchParams params = {};
+    params.mode = eModeReframe;
+    plugin->aimView(p_Time, h > 0.0 ? w / h : 1.0, params);
+    const auto* draw = OFX::Private::gDrawSuite;
+    const double halfBlend = 0.5 * m_Blend->getValueAtTime(p_Time);
+    const OfxRGBAColourF colour = {1.0f, 0.35f, 0.75f, 0.9f};
+    const OfxRGBAColourF faint = {1.0f, 0.35f, 0.75f, 0.45f};
+
+    bool labelled = false;
+    for (double offset : {0.0, -halfBlend, halfBlend})
+    {
+        draw->setColour(p_Context, offset == 0.0 ? &colour : &faint);
+        draw->setLineWidth(p_Context, offset == 0.0 ? 2.0f : 1.0f);
+        for (const auto& piece : SeamInView(params, offset))
+        {
+            std::vector<OfxPointD> points;
+            points.reserve(piece.size());
+            for (const ViewPoint& point : piece)
+            {
+                points.push_back({p_Layout.frame.x1 + point.u * w, p_Layout.frame.y1 + (1.0 - point.v) * h});
+            }
+            draw->draw(p_Context, kOfxDrawPrimitiveLineStrip, points.data(), int(points.size()));
+            if (offset == 0.0 && !labelled)
+            {
+                // Label at the piece's point nearest the middle of the frame, so it stays readable.
+                size_t best = 0;
+                for (size_t i = 1; i < piece.size(); ++i)
+                {
+                    best = fabs(piece[i].v - 0.5) < fabs(piece[best].v - 0.5) ? i : best;
+                }
+                const OfxPointD at[] = {{points[best].x + 6.0 * p_Layout.px.x, points[best].y}};
+                draw->drawText(p_Context, "Seam", at, kOfxDrawTextAlignmentLeft);
+                labelled = true;
+            }
+        }
+    }
 }
 
 bool ReframeInteract::draw(const OFX::DrawArgs& p_Args)
@@ -1269,6 +1328,13 @@ bool ReframeInteract::draw(const OFX::DrawArgs& p_Args)
     // Track: a dark bar, filled light from the bottom up to the knob.
     const OfxRGBAColourF shade = {0.0f, 0.0f, 0.0f, 0.55f};
     const OfxRGBAColourF light = {1.0f, 1.0f, 1.0f, 0.85f};
+
+    // The seam between the lenses, with the edges of the blend: keep people off it, as close
+    // subjects there cannot line up in both lenses.
+    if (m_ShowSeam->getValueAtTime(p_Args.time))
+    {
+        drawSeam(context, l, p_Args.time);
+    }
     draw->setColour(context, &shade);
     const OfxPointD back[] = {{l.trackX - halfW - l.px.x, l.trackBottom - l.px.y}, {l.trackX + halfW + l.px.x, l.trackTop + l.px.y}};
     draw->draw(context, kOfxDrawPrimitiveRectangle, back, 2);
@@ -1600,6 +1666,16 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     noDistortion->setDefault(false);
     noDistortion->setParent(*reframe);
     page->addChild(*noDistortion);
+
+    OFX::BooleanParamDescriptor* showSeam = p_Desc.defineBooleanParam(kParamShowSeam);
+    showSeam->setLabels("Show Seam", "Show Seam", "Show Seam");
+    showSeam->setHint("Draws where the two lenses meet, with the edges of the blend, while the viewer is in Open FX "
+                      "Overlay mode. People close to the camera cannot line up exactly on the seam, so aim to keep "
+                      "them off it. Only drawn on the viewer, never rendered.");
+    showSeam->setDefault(true);
+    showSeam->setAnimates(false);
+    showSeam->setParent(*reframe);
+    page->addChild(*showSeam);
 
     OFX::GroupParamDescriptor* tracking = p_Desc.defineGroupParam("tracking");
     tracking->setLabels("Subject Tracking", "Subject Tracking", "Subject Tracking");

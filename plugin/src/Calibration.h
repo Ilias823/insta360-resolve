@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "StitchKernel.h"
 
@@ -41,6 +42,17 @@ void FillViewParams(double p_Pan, double p_Tilt, double p_Roll, double p_Fov, do
 // Rig-space direction seen at a point of the reframed view; p_U and p_V run 0..1 across the
 // frame, p_V from the top. Same maths as the Metal kernel.
 void ViewPointToRay(const StitchParams& p_Params, double p_U, double p_V, double p_Ray[3]);
+
+// A point of the reframed view, u and v running 0..1 across the frame, v from the top.
+struct ViewPoint
+{
+    double u, v;
+};
+
+// Where the seam between the lenses falls in the reframed view, or a line p_OffsetDeg beside it
+// (towards lens A when positive): pieces of line, each a list of points. Empty where the seam is
+// out of view. Same maths as the Metal kernel, stabilisation (p_Params.stab) included.
+std::vector<std::vector<ViewPoint>> SeamInView(const StitchParams& p_Params, double p_OffsetDeg);
 
 // Fills StitchParams::lens for a side-by-side frame of the given size. The two axes are scaled
 // separately, because hosts also render squeezed frames (Resolve's thumbnails are 16:9).
