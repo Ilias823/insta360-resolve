@@ -30,6 +30,9 @@ using namespace metal;
 #define DEPTH_PRIOR 0.02        // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
 #define DEFAULT_INV_DISTANCE 0.5
 #define DEPTH_TABLE_SIGMA_DEG 4.0
+#define DETAIL_BAND_DEG 0.3     // two-band blend: fine detail switches lenses within +-this ...
+#define COLOUR_BLUR_DEG 1.0     // ... while the picture blurred by about this much fades over the whole blend
+#define LENS_FOV_DEG 190.0      // field of view across a lens picture, for turning degrees into lens pixels
 static_assert(SEAM_BINS == HOST_SEAM_BINS && SEAM_COLUMNS * DEPTH_STEPS == HOST_SEAM_COSTS,
               "kSeamBins and kSeamCosts in StitchKernel.h must match the shader");
 #define MATCH_GRID 32           // points per side and lens where the decoded lenses are compared with the input
@@ -636,15 +639,37 @@ kernel void StitchKernel(constant StitchParams& p [[buffer(1)]],
             dyB = okB && ProjectToLens(p, 1, LensRay(p, rayY, seam.w * near, -1.0), q) ? q - posB : float2(0.0);
         }
         float3 sum = float3(0.0);
-        if (wA > 0.0)
+        if (src.decoded && wA > 0.0 && wB > 0.0)
         {
-            sum += wA * SampleSource(src, p, 0, posA, dxA, dyA, -1.0) / root;
+            // Two-band blend: colour and brightness (each lens blurred) fade over the whole blend,
+            // fine detail (the rest) switches lenses in a thin line. Where the lenses disagree,
+            // as on a person close to the camera, that shows a small step instead of both
+            // pictures at once. The blurred picture is a coarser mip level, never finer than
+            // the output pixel's own footprint.
+            const float colourLod = log2(max(COLOUR_BLUR_DEG * LensSize(p).x / LENS_FOV_DEG, 1.0));
+            const float lodA = max(colourLod, log2(max(max(length(dxA), length(dyA)), 1.0)));
+            const float lodB = max(colourLod, log2(max(max(length(dxB), length(dyB)), 1.0)));
+            const float3 fullA = SampleSource(src, p, 0, posA, dxA, dyA, -1.0) / root;
+            const float3 fullB = SampleSource(src, p, 1, posB, dxB, dyB, -1.0) * root;
+            const float3 lowA = SampleSource(src, p, 0, posA, float2(0.0), float2(0.0), lodA) / root;
+            const float3 lowB = SampleSource(src, p, 1, posB, float2(0.0), float2(0.0), lodB) * root;
+            const float band = min(sin(DETAIL_BAND_DEG * M_PI_F / 180.0), p.blendBand);
+            const float wDetail = smoothstep(-band, band, ray.z);
+            sum = wA * lowA + wB * lowB + wDetail * (fullA - lowA) + (1.0 - wDetail) * (fullB - lowB);
+            px = float4(sum, 1.0);
         }
-        if (wB > 0.0)
+        else
         {
-            sum += wB * SampleSource(src, p, 1, posB, dxB, dyB, -1.0) * root;
+            if (wA > 0.0)
+            {
+                sum += wA * SampleSource(src, p, 0, posA, dxA, dyA, -1.0) / root;
+            }
+            if (wB > 0.0)
+            {
+                sum += wB * SampleSource(src, p, 1, posB, dxB, dyB, -1.0) * root;
+            }
+            px = float4(sum / max(wA + wB, 1e-6), 1.0);
         }
-        px = float4(sum / max(wA + wB, 1e-6), 1.0);
     }
     else
     {
