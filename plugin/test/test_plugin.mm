@@ -158,9 +158,20 @@ static bool DecodeScaled(const char* p_Path, int p_Frame, int p_W, int p_H, std:
             outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
         [reader addOutput:output];
         const CMTime duration = track.minFrameDuration;
-        reader.timeRange = CMTimeRangeMake(CMTimeMultiplyByFloat64(duration, fmax(p_Frame - 0.5, 0.0)), kCMTimePositiveInfinity);
+        // As in LensDecoder.mm: the reader first returns the frame the start falls in, stamped with
+        // the start time, so start inside the frame before and read on to this frame.
+        reader.timeRange = CMTimeRangeMake(CMTimeMultiplyByFloat64(duration, fmax(p_Frame - 0.75, 0.0)), kCMTimePositiveInfinity);
         [reader startReading];
-        CMSampleBufferRef sample = [output copyNextSampleBuffer];
+        CMSampleBufferRef sample = nullptr;
+        while ((sample = [output copyNextSampleBuffer]))
+        {
+            const double index = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)) / CMTimeGetSeconds(duration);
+            if (llround(index) >= p_Frame && CMSampleBufferGetImageBuffer(sample))
+            {
+                break;
+            }
+            CFRelease(sample);
+        }
         if (!sample)
         {
             return false;
