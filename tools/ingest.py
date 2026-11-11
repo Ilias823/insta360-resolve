@@ -161,7 +161,11 @@ def split(src, out_dir, report=lambda fraction: None):
     """Returns (lensA, lensB, info). Skips work already done."""
     streams = probe(src)
     lens_files = [out_dir / f"{src.stem}_lens{c}.mov" for c in "AB"]
-    if not all(f.exists() and f.stat().st_mtime >= src.stat().st_mtime for f in lens_files):
+    done = all(f.exists() and f.stat().st_mtime >= src.stat().st_mtime for f in lens_files)
+    # Lens files from before 0.5 have no sound; copy those again.
+    if done and media_tool() and media_probe(src).get("audio") and not media_probe(lens_files[0]).get("audio"):
+        done = False
+    if not done:
         # Written under temporary names, so a cancelled or failed copy is never taken as done.
         parts = [f.with_name(f.stem + ".part.mov") for f in lens_files]
         try:
@@ -169,8 +173,8 @@ def split(src, out_dir, report=lambda fraction: None):
                 run_tool_reporting([str(media_tool()), "split", str(src)] + [str(f) for f in parts], report)
             else:
                 cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src)]
-                for s, f in zip(streams, parts):
-                    cmd += ["-map", f"0:{s['index']}", "-c", "copy", "-tag:v", "hvc1", str(f)]
+                for n, (s, f) in enumerate(zip(streams, parts)):
+                    cmd += ["-map", f"0:{s['index']}"] + (["-map", "0:a?"] if n == 0 else []) + ["-c", "copy", "-tag:v", "hvc1", str(f)]
                 run_reporting(cmd, duration(src), report)
             for part, f in zip(parts, lens_files):
                 part.replace(f)

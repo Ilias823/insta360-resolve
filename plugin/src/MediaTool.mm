@@ -3,7 +3,8 @@
 //
 //   MediaTool probe <clip>                   video streams and duration, as JSON
 //   MediaTool split <clip> <lensA> <lensB>   copy each video stream to its own .mov, without
-//                                            re-encoding; prints "progress <0..1>" lines
+//                                            re-encoding; the clip's sound goes with lens A;
+//                                            prints "progress <0..1>" lines
 //   MediaTool frame <video> <seconds> <size> one frame scaled to size x size, raw 8-bit RGB on stdout
 //   MediaTool still <image> <frames> <rate> <out.mov>
 //                                            a still image (with transparency) as a ProRes 4444 movie of
@@ -83,7 +84,8 @@ static int Probe(NSString* p_Path)
                              @"height": @(llround(track.naturalSize.height)), @"r_frame_rate": rate,
                              @"nb_frames": @(frames)}];
     }
-    NSDictionary* result = @{@"duration": @(CMTimeGetSeconds(asset.duration)), @"streams": streams};
+    NSDictionary* result = @{@"duration": @(CMTimeGetSeconds(asset.duration)), @"streams": streams,
+                             @"audio": @([asset tracksWithMediaType:AVMediaTypeAudio].count)};
     NSData* json = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
     fwrite(json.bytes, 1, json.length, stdout);
     printf("\n");
@@ -111,6 +113,16 @@ static int Split(NSString* p_Path, NSArray<NSString*>* p_Outputs)
         if (![lane insertTimeRange:tracks[i].timeRange ofTrack:tracks[i] atTime:kCMTimeZero error:&error])
         {
             return Fail([NSString stringWithFormat:@"cannot read lens %lu: %@", (unsigned long)i + 1, error.localizedDescription]);
+        }
+        // The clip's sound goes with lens A, so that the clip built from the lenses has it.
+        for (AVAssetTrack* sound in i == 0 ? [asset tracksWithMediaType:AVMediaTypeAudio] : @[])
+        {
+            AVMutableCompositionTrack* soundLane = [composition addMutableTrackWithMediaType:AVMediaTypeAudio
+                                                                            preferredTrackID:kCMPersistentTrackID_Invalid];
+            if (![soundLane insertTimeRange:sound.timeRange ofTrack:sound atTime:sound.timeRange.start error:&error])
+            {
+                return Fail([NSString stringWithFormat:@"cannot read the sound: %@", error.localizedDescription]);
+            }
         }
         AVAssetExportSession* session = [AVAssetExportSession exportSessionWithAsset:composition
                                                                           presetName:AVAssetExportPresetPassthrough];

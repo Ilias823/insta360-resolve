@@ -283,10 +283,23 @@ local function build(clip)
     end
     local tagItems, tagMedia = addTagTrack(timeline, clip.tag, start)
     local parts = {itemA, itemB}
+    -- The clip's sound, which the import put in the lens A file: Resolve placed it on the audio
+    -- tracks along with the picture, and it has to be named to become part of the compound clip.
+    for track = 1, timeline:GetTrackCount("audio") do
+        for _, item in ipairs(timeline:GetItemListInTrack("audio", track) or {}) do
+            table.insert(parts, item)
+        end
+    end
     for _, item in ipairs(tagItems) do
         table.insert(parts, item)
     end
-    if not timeline:CreateCompoundClip(parts, {name = compoundName}) then
+    -- With sound among the parts Resolve returns nothing even when it worked (seen on 21.1.2),
+    -- so look for the clip itself.
+    local made = timeline:CreateCompoundClip(parts, {name = compoundName})
+    for _, existing in ipairs(not made and pool:GetCurrentFolder():GetClipList() or {}) do
+        made = made or existing:GetName() == compoundName
+    end
+    if not made then
         return "FAILED: could not create the compound clip"
     end
     -- The working timeline is not needed once the compound clip exists (it keeps its own copy),
