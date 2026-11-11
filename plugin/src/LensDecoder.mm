@@ -20,7 +20,7 @@
 
 static const int kKeepDecoded = 4;     // recent frames kept per lens, for renders that arrive out of order
 static const int kReadAheadLimit = 30; // frames read on rather than opening a new reader at the frame
-static const int kKeepFrames = 3;      // frames kept on the GPU, for re-renders of the same frame
+static const int kKeepFrames = 4;      // frames kept on the GPU: a render reads its neighbours too, and re-renders are common
 static const double kIdleSeconds = 10.0; // readers and frames unused this long are released
 
 static double SecondsNow()

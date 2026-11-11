@@ -132,10 +132,11 @@ public:
 
     void setSrcImg(OFX::Image* p_SrcImg) { m_SrcImg = p_SrcImg; }
     void setParams(const StitchParams& p_Params) { m_Params = p_Params; }
-    void setLensImages(const LensImages* p_Lenses, std::shared_ptr<FullResCheck> p_Check)
+    void setLensImages(const LensImages* p_Lenses, std::shared_ptr<FullResCheck> p_Check, const LensImages* p_Neighbours)
     {
         m_Lenses = p_Lenses;
         m_Check = p_Check;
+        m_Neighbours = p_Neighbours;
     }
 
     void processImagesMetal() override;
@@ -145,6 +146,7 @@ private:
     OFX::Image* m_SrcImg;
     StitchParams m_Params;
     const LensImages* m_Lenses = nullptr;
+    const LensImages* m_Neighbours = nullptr; // frames before and after, for the seam analysis
     std::shared_ptr<FullResCheck> m_Check;
 };
 
@@ -153,7 +155,7 @@ void StitchProcessor::processImagesMetal()
     const float* input = static_cast<const float*>(m_SrcImg->getPixelData());
     float* output = static_cast<float*>(_dstImg->getPixelData());
 
-    if (!RunStitchMetalKernel(_pMetalCmdQ, m_Params, input, output, m_Lenses, m_Check))
+    if (!RunStitchMetalKernel(_pMetalCmdQ, m_Params, input, output, m_Lenses, m_Check, m_Neighbours))
     {
         LogOnce("ERROR: Metal kernel failed to build; see Resolve's console output");
         OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -1019,6 +1021,7 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     // Full resolution: Resolve only gives the effect as many pixels as the timeline has, so read
     // the lenses from the clip's own files when that is more. Resolve's picture stays the fallback.
     LensImages lensImages;
+    LensImages neighbours[2];
     // The kernel checks that the decoded frame is the one Resolve passed in; where it never is,
     // such as in Fusion, whose time counts from the start of the comp, decoding is a waste.
     const bool neverMatched = m_FullResCheck->matched == 0 && m_FullResCheck->mismatched >= kFullResGiveUp;
@@ -1054,6 +1057,17 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
             snprintf(sizes, sizeof(sizes), "full resolution: lenses %dx%d %d-bit for a %dx%d frame",
                      lensImages.width, lensImages.height, lensImages.bits, params.width, params.height);
             LogOnce(sizes);
+
+            // The seam analysis also looks at the frames before and after, so that the stitch
+            // distance does not flip between frames. Missing ones (clip ends) are left out.
+            for (int i = 0; i < 2; ++i)
+            {
+                const int frame = int(lround(p_Args.time)) + (i == 0 ? -1 : 1);
+                if (frame < 0 || !AcquireLensImages(p_Args.pMetalCmdQ, files.lensA, files.lensB, frame, neighbours[i]))
+                {
+                    neighbours[i] = LensImages();
+                }
+            }
         }
     }
 
@@ -1073,7 +1087,7 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     processor.setDstImg(dst.get());
     processor.setSrcImg(src.get());
     processor.setParams(params);
-    processor.setLensImages(params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck);
+    processor.setLensImages(params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck, params.fullRes != 0 ? neighbours : nullptr);
     processor.setGPURenderArgs(p_Args);
     processor.setRenderWindow(p_Args.renderWindow);
     processor.process();

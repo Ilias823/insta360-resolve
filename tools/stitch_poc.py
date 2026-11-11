@@ -93,19 +93,24 @@ def project(lens, rays, video_w, f_div, c_div, dtype=np.float32):
     return u.astype(dtype), v.astype(dtype), ok
 
 
-# Seam analysis, mirrored by SeamKernel in plugin/src/MetalKernel.mm: the stitch distance and the
-# colour difference between the lenses, measured on a grid of rays around the seam each frame.
+# Seam analysis, mirrored by SeamCostKernel and SeamKernel in plugin/src/MetalKernel.mm: the stitch
+# distance and the colour difference between the lenses, measured on a grid of rays around the
+# seam each frame. (With the lens files decoded, the plugin also adds the match of the frames
+# before and after; this reference looks at one frame, as the comparison test does.)
 SEAM_COLUMNS = 256      # samples around the seam ...
 SEAM_ROWS = 32          # ... and across it, within +-SEAM_BAND_DEG (the lenses overlap about +-6)
 SEAM_BAND_DEG = 4.0
+DEPTH_BAND_DEG = 2.25   # the stitch distance is judged only here, where the default 4 degree blend mixes the lenses
+MEDIAN_COLUMNS = 5      # the distance found for each column is the median of this many around it
+EDGE_WEIGHT = 2.0       # weight of differences in brightness change, across and along the seam, in the match
 SEAM_BINS = 64          # table entries around the seam
 SEAM_FADE_DEG = 30.0    # the corrections fade out between the band edge and this distance from the seam
 GAIN_SIGMA_DEG = 15.0   # smoothing of the gain along the seam
 GAIN_PRIOR = 64.0       # pulls bins with few usable samples towards the global gain
-DEPTH_STEPS = 12        # candidate stitch distances, evenly spaced in 1 / distance ...
-MAX_INV_DISTANCE = 2.5  # ... from infinity to 0.4 m
+DEPTH_STEPS = 13        # candidate stitch distances, evenly spaced in 1 / distance ...
+MAX_INV_DISTANCE = 3.0  # ... from infinity to 0.33 m
 DEPTH_SIGMA_DEG = 12.0  # the match of each candidate is pooled over this much of the seam
-DEPTH_PRIOR = 0.05      # cost per 1/m away from DEFAULT_DISTANCE: keeps flat areas put and frames steady
+DEPTH_PRIOR = 0.02      # cost per 1/m away from DEFAULT_DISTANCE: keeps flat areas put and frames steady
 DEFAULT_DISTANCE = 2.0  # metres; also the plugin's Stitch Distance default
 DEPTH_TABLE_SIGMA_DEG = 4.0
 
@@ -165,13 +170,29 @@ def seam_tables(frames, lenses, auto_distance=True, inv_distance=1 / DEFAULT_DIS
 
     # 1. Stitch distance per column: the candidate where the lenses agree best across the seam,
     #    pooled along the seam, with a small pull towards the default distance.
+    #    The match is the brightness difference plus differences in how brightness changes from
+    #    the previous row (across the seam) and to a sample one row spacing along it, within
+    #    +-DEPTH_BAND_DEG.
     if auto_distance:
         steps = np.arange(DEPTH_STEPS) * MAX_INV_DISTANCE / (DEPTH_STEPS - 1)
+        band = np.sin(np.radians(DEPTH_BAND_DEG))
+        zd = band * ((np.arange(SEAM_ROWS) + 0.5) / SEAM_ROWS * 2 - 1)
+        spacing = 2 * band / SEAM_ROWS
+        ray_sets = []
+        for along in (0.0, spacing):
+            pd, zz = np.meshgrid(phi + along, zd)
+            cd = np.sqrt(1 - zz * zz)
+            ray_sets.append(np.stack([cd * np.cos(pd), cd * np.sin(pd), zz]))
         cost_sum, cost_n = [], []
         for q in steps:
-            (a, b), (va, vb) = warp(frames, lenses, lens_rays(rays, offset, q), f_div, c_div, roll_sign)
-            ok = va & vb
-            diff = np.abs(a.mean(2) - b.mean(2)) / 255.0
+            (a, b), (va, vb) = warp(frames, lenses, lens_rays(ray_sets[0], offset, q), f_div, c_div, roll_sign)
+            (an, bn), (van, vbn) = warp(frames, lenses, lens_rays(ray_sets[1], offset, q), f_div, c_div, roll_sign)
+            ok = va & vb & van & vbn
+            a, b = a.mean(2) / 255.0, b.mean(2) / 255.0
+            along = np.abs((an.mean(2) / 255.0 - a) - (bn.mean(2) / 255.0 - b))
+            across = np.zeros_like(a)
+            across[1:] = np.where(ok[:-1], np.abs((a[1:] - a[:-1]) - (b[1:] - b[:-1])), 0.0)
+            diff = np.abs(a - b) + EDGE_WEIGHT * (along + across)
             cost_sum.append((diff * ok).sum(0))
             cost_n.append(ok.sum(0).astype(np.float64))
         pool = np.exp(-0.5 * (dphi / np.radians(DEPTH_SIGMA_DEG)) ** 2)
@@ -185,6 +206,9 @@ def seam_tables(frames, lenses, auto_distance=True, inv_distance=1 / DEFAULT_DIS
         curve = lo - 2 * mid + hi
         shift = np.where(curve > 1e-9, np.clip(0.5 * (lo - hi) / np.maximum(curve, 1e-9), -0.5, 0.5), 0.0)
         col_q[inner] += shift * steps[1]
+        # Median of each column and its neighbours: a single column that disagrees is noise.
+        offsets = np.arange(MEDIAN_COLUMNS) - MEDIAN_COLUMNS // 2
+        col_q = np.median(np.stack([np.roll(col_q, -o) for o in offsets]), axis=0)
     else:
         col_q = np.full(SEAM_COLUMNS, float(inv_distance))
 

@@ -27,6 +27,8 @@ enum LensSlot
 
 // Size of the per-frame seam table; SEAM_BINS in the shader source in MetalKernel.mm.
 const int kSeamBins = 64;
+// Seam columns times candidate distances; SEAM_COLUMNS * DEPTH_STEPS in the shader source.
+const int kSeamCosts = 256 * 13;
 
 // Parameters for the Metal kernel. Only 4-byte fields, so the layout is identical to the
 // struct of the same name in the shader source in MetalKernel.mm.
@@ -55,6 +57,7 @@ struct StitchParams
     float yuvScale;  // decoded texture value * yuvScale = code value / (2^bits - 1)
     float chromaMid; // zero chroma as code value / (2^bits - 1)
     int trustDecoded; // 1 = use the decoded lenses without comparing them with the input, fullRes only
+    int seamFrames;   // set by RunStitchMetalKernel: bit 0 the frame before, bit 1 the frame after help the seam analysis
 };
 
 struct LensImages;
@@ -72,9 +75,12 @@ struct FullResCheck
 int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input);
 
 // Runs the kernel on host-provided MTLBuffers. Returns false if the shader failed to build.
-// With p_Params.fullRes the lenses are read from p_Lenses instead of p_Input.
+// With p_Params.fullRes the lenses are read from p_Lenses instead of p_Input. p_Neighbours, if
+// given, are the decoded frames before and after (an empty LensImages where there is none); the
+// seam analysis then also looks at them, which keeps the stitch distance steady.
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output,
-                          const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr);
+                          const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr,
+                          const LensImages* p_Neighbours = nullptr);
 
 // Smears p_Output, in place, along the movement in two id<MTLTexture> of RG32Float (MotionBlur.h).
 // p_Wrap: the left and right edges meet, as in a 360 picture. Commits without waiting.

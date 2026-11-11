@@ -512,7 +512,17 @@ static int BlurFile(int argc, char** argv)
     const NSUInteger bytes = NSUInteger(width) * height * 16;
     id<MTLBuffer> src = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> dst = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    RunStitchMetalKernel(queue, params, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst), &images);
+    // As in the plugin, the seam analysis also looks at the frames before and after.
+    LensImages neighbours[2];
+    for (int i = 0; i < 2; ++i)
+    {
+        const int other = frame + (i == 0 ? -1 : 1);
+        if (other < 0 || !AcquireLensImages(queue, argv[2], argv[3], other, neighbours[i]))
+        {
+            neighbours[i] = LensImages();
+        }
+    }
+    RunStitchMetalKernel(queue, params, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst), &images, nullptr, neighbours);
 
     double blurSeconds = 0.0;
     if (amount > 0.0f)

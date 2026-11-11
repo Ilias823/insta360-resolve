@@ -17,16 +17,21 @@ using namespace metal;
 #define SEAM_COLUMNS 256        // samples around the seam ...
 #define SEAM_ROWS 32            // ... and across it, within +-SEAM_BAND_DEG (the lenses overlap about +-6)
 #define SEAM_BAND_DEG 4.0
+#define DEPTH_BAND_DEG 2.25     // the stitch distance is judged only here, where the default 4 degree blend mixes the lenses
+#define MEDIAN_COLUMNS 5        // the distance found for each column is the median of this many around it
+#define EDGE_WEIGHT 2.0         // weight of differences in brightness change, across and along the seam, in the match
 #define SEAM_BINS 64            // table entries around the seam; entry SEAM_BINS holds the global gain
 #define SEAM_FADE_DEG 30.0      // the corrections fade out between the band edge and this distance from the seam
 #define GAIN_SIGMA_DEG 15.0     // smoothing of the gain along the seam
 #define GAIN_PRIOR 64.0         // pulls entries with few usable samples towards the global gain
-#define DEPTH_STEPS 12          // candidate stitch distances, evenly spaced in 1 / distance ...
-#define MAX_INV_DISTANCE 2.5    // ... from infinity to 0.4 m
+#define DEPTH_STEPS 13          // candidate stitch distances, evenly spaced in 1 / distance ...
+#define MAX_INV_DISTANCE 3.0    // ... from infinity to 0.33 m
 #define DEPTH_SIGMA_DEG 12.0    // the match of each candidate is pooled over this much of the seam
-#define DEPTH_PRIOR 0.05        // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
+#define DEPTH_PRIOR 0.02        // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
 #define DEFAULT_INV_DISTANCE 0.5
 #define DEPTH_TABLE_SIGMA_DEG 4.0
+static_assert(SEAM_BINS == HOST_SEAM_BINS && SEAM_COLUMNS * DEPTH_STEPS == HOST_SEAM_COSTS,
+              "kSeamBins and kSeamCosts in StitchKernel.h must match the shader");
 #define MATCH_GRID 32           // points per side and lens where the decoded lenses are compared with the input
 #define MATCH_MAX_DIFF 0.04     // mean brightness difference above which the decoded frame is not the input's
 
@@ -55,6 +60,7 @@ struct StitchParams
     float yuvScale;
     float chromaMid;
     int trustDecoded;
+    int seamFrames;
 };
 
 // Where the lens pictures come from: Resolve's input buffer, or with fullRes the lens files
@@ -200,10 +206,13 @@ static float3 LensRay(constant StitchParams& p, float3 p_Ray, float p_InvDistanc
     return normalize(p_Ray + p_Sign * p_InvDistance * halfOffset);
 }
 
-static float3 SeamRay(int p_Column, int p_Row)
+// Direction at a sample of the seam band: p_Row runs across the seam within +-p_BandDeg, and
+// p_Along moves along the seam by that many rows' spacing.
+static float3 SeamRay(int p_Column, int p_Row, float p_BandDeg = SEAM_BAND_DEG, float p_Along = 0.0)
 {
-    const float phi = (float(p_Column) + 0.5) / SEAM_COLUMNS * 2.0 * M_PI_F;
-    const float z = sin(SEAM_BAND_DEG * M_PI_F / 180.0) * ((float(p_Row) + 0.5) / SEAM_ROWS * 2.0 - 1.0);
+    const float spacing = 2.0 * sin(p_BandDeg * M_PI_F / 180.0) / SEAM_ROWS;
+    const float phi = (float(p_Column) + 0.5) / SEAM_COLUMNS * 2.0 * M_PI_F + p_Along * spacing;
+    const float z = sin(p_BandDeg * M_PI_F / 180.0) * ((float(p_Row) + 0.5) / SEAM_ROWS * 2.0 - 1.0);
     const float s = sqrt(1.0 - z * z);
     return float3(s * cos(phi), s * sin(phi), z);
 }
@@ -221,26 +230,21 @@ static float ColumnAngle(int p_A, int p_B)
 //    pooled along the seam, with a small pull towards the default distance;
 // 2. colour of both lenses at that distance, leaving out near black, clipped and mismatched samples.
 // Runs as one threadgroup; each thread handles whole columns.
-kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
-                       const device float* p_Input [[buffer(0)]],
-                       device float4* p_Table [[buffer(2)]],
-                       texture2d<float> p_Luma0 [[texture(0)]],
-                       texture2d<float> p_Chroma0 [[texture(1)]],
-                       texture2d<float> p_Luma1 [[texture(2)]],
-                       texture2d<float> p_Chroma1 [[texture(3)]],
-                       uint tid [[thread_position_in_threadgroup]],
-                       uint count [[threads_per_threadgroup]])
+// Whether the decoded lenses are the frame in the input, into entry SEAM_BINS + 1 of the table:
+// the host's time is not always the frame in the file (in Fusion it counts from the start of
+// the comp). Both are compared at the input's resolution, inside the image circles. fullRes only;
+// runs as one threadgroup.
+kernel void CheckKernel(constant StitchParams& p [[buffer(1)]],
+                        const device float* p_Input [[buffer(0)]],
+                        device float4* p_Table [[buffer(2)]],
+                        texture2d<float> p_Luma0 [[texture(0)]],
+                        texture2d<float> p_Chroma0 [[texture(1)]],
+                        texture2d<float> p_Luma1 [[texture(2)]],
+                        texture2d<float> p_Chroma1 [[texture(3)]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint count [[threads_per_threadgroup]])
 {
-    threadgroup float costSum[SEAM_COLUMNS * DEPTH_STEPS];
-    threadgroup ushort costCount[SEAM_COLUMNS * DEPTH_STEPS];
-    threadgroup float colQ[SEAM_COLUMNS];
-    threadgroup float4 colA[SEAM_COLUMNS]; // rgb sums, w = number of samples used
-    threadgroup float4 colB[SEAM_COLUMNS];
     threadgroup float2 matchSum[256]; // per thread: brightness difference, points
-
-    // With fullRes, first check that the decoded frame is the one in the input: the host's time
-    // is not always the frame in the file (in Fusion it counts from the start of the comp).
-    // Both are compared at the input's resolution, inside the image circles.
     bool decoded = false;
     if (p.fullRes != 0 && p.trustDecoded != 0)
     {
@@ -250,7 +254,7 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
             p_Table[SEAM_BINS + 1] = float4(1.0, 0.0, 0.0, 0.0);
         }
     }
-    else if (p.fullRes != 0)
+    else
     {
         const Source probe = {true, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
         const float2 size = LensSize(p);
@@ -285,36 +289,110 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
             p_Table[SEAM_BINS + 1] = float4(decoded ? 1.0 : 0.0, diff, 0.0, 0.0);
         }
     }
+}
+
+// How well the lenses match along one seam column if things were at candidate distance p_Step:
+// brightness difference, plus differences in how brightness changes from the previous row
+// (across the seam) and to a sample one row spacing along it, so that edges which line up count,
+// not only equal brightness. Only within +-DEPTH_BAND_DEG, where the blend mixes the lenses.
+static float2 SeamCost(Source p_Src, constant StitchParams& p, int p_Column, int p_Step)
+{
+    const float q = p_Step * MAX_INV_DISTANCE / (DEPTH_STEPS - 1);
+    float sum = 0.0;
+    int n = 0;
+    float prevA = 0.0, prevB = 0.0;
+    bool prev = false;
+    for (int r = 0; r < SEAM_ROWS; ++r)
+    {
+        const float3 ray = SeamRay(p_Column, r, DEPTH_BAND_DEG);
+        const float3 next = SeamRay(p_Column, r, DEPTH_BAND_DEG, 1.0);
+        float2 posA, posB, nextA, nextB;
+        if (ProjectToLens(p, 0, LensRay(p, ray, q, 1.0), posA) &&
+            ProjectToLens(p, 1, LensRay(p, ray, q, -1.0), posB) &&
+            ProjectToLens(p, 0, LensRay(p, next, q, 1.0), nextA) &&
+            ProjectToLens(p, 1, LensRay(p, next, q, -1.0), nextB))
+        {
+            const float a = dot(SeamSample(p_Src, p, 0, posA), float3(1.0 / 3.0));
+            const float b = dot(SeamSample(p_Src, p, 1, posB), float3(1.0 / 3.0));
+            const float alongA = dot(SeamSample(p_Src, p, 0, nextA), float3(1.0 / 3.0)) - a;
+            const float alongB = dot(SeamSample(p_Src, p, 1, nextB), float3(1.0 / 3.0)) - b;
+            const float across = prev ? abs((a - prevA) - (b - prevB)) : 0.0;
+            sum += abs(a - b) + EDGE_WEIGHT * (abs(alongA - alongB) + across);
+            ++n;
+            prevA = a;
+            prevB = b;
+            prev = true;
+        }
+        else
+        {
+            prev = false;
+        }
+    }
+    return float2(sum, float(n));
+}
+
+// Match of every candidate distance at every seam column, one thread each. With the decoded
+// lenses of the frames before and after (p.seamFrames), their match counts too, half as much as
+// this frame's: things that are really there stay put between frames, so the distance found
+// does not flip back and forth.
+kernel void SeamCostKernel(constant StitchParams& p [[buffer(1)]],
+                           const device float* p_Input [[buffer(0)]],
+                           const device float4* p_Table [[buffer(2)]],
+                           device float2* p_Costs [[buffer(3)]],
+                           texture2d<float> p_Luma0 [[texture(0)]],
+                           texture2d<float> p_Chroma0 [[texture(1)]],
+                           texture2d<float> p_Luma1 [[texture(2)]],
+                           texture2d<float> p_Chroma1 [[texture(3)]],
+                           texture2d<float> p_PrevLuma0 [[texture(4)]],
+                           texture2d<float> p_PrevChroma0 [[texture(5)]],
+                           texture2d<float> p_PrevLuma1 [[texture(6)]],
+                           texture2d<float> p_PrevChroma1 [[texture(7)]],
+                           texture2d<float> p_NextLuma0 [[texture(8)]],
+                           texture2d<float> p_NextChroma0 [[texture(9)]],
+                           texture2d<float> p_NextLuma1 [[texture(10)]],
+                           texture2d<float> p_NextChroma1 [[texture(11)]],
+                           uint id [[thread_position_in_grid]])
+{
+    if (id >= uint(SEAM_COLUMNS * DEPTH_STEPS))
+    {
+        return;
+    }
+    const int c = int(id) / DEPTH_STEPS, k = int(id) % DEPTH_STEPS;
+    const bool decoded = p.fullRes != 0 && p_Table[SEAM_BINS + 1].x > 0.5;
+    float2 cost = 2.0 * SeamCost(Source{decoded, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1}, p, c, k);
+    if (decoded && (p.seamFrames & 1) != 0)
+    {
+        cost += SeamCost(Source{true, p_Input, p_PrevLuma0, p_PrevChroma0, p_PrevLuma1, p_PrevChroma1}, p, c, k);
+    }
+    if (decoded && (p.seamFrames & 2) != 0)
+    {
+        cost += SeamCost(Source{true, p_Input, p_NextLuma0, p_NextChroma0, p_NextLuma1, p_NextChroma1}, p, c, k);
+    }
+    p_Costs[id] = cost;
+}
+
+kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
+                       const device float* p_Input [[buffer(0)]],
+                       device float4* p_Table [[buffer(2)]],
+                       const device float2* p_Costs [[buffer(3)]],
+                       texture2d<float> p_Luma0 [[texture(0)]],
+                       texture2d<float> p_Chroma0 [[texture(1)]],
+                       texture2d<float> p_Luma1 [[texture(2)]],
+                       texture2d<float> p_Chroma1 [[texture(3)]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       uint count [[threads_per_threadgroup]])
+{
+    threadgroup float colQ[SEAM_COLUMNS];
+    threadgroup float colM[SEAM_COLUMNS]; // scratch for the median
+    threadgroup float4 colA[SEAM_COLUMNS]; // rgb sums, w = number of samples used
+    threadgroup float4 colB[SEAM_COLUMNS];
+
+    const bool decoded = p.fullRes != 0 && p_Table[SEAM_BINS + 1].x > 0.5;
     const Source src = {decoded, p_Input, p_Luma0, p_Chroma0, p_Luma1, p_Chroma1};
 
     const float stepQ = MAX_INV_DISTANCE / (DEPTH_STEPS - 1);
     if (p.autoDistance != 0)
     {
-        for (uint c = tid; c < SEAM_COLUMNS; c += count)
-        {
-            for (int k = 0; k < DEPTH_STEPS; ++k)
-            {
-                float sum = 0.0;
-                int n = 0;
-                for (int r = 0; r < SEAM_ROWS; ++r)
-                {
-                    const float3 ray = SeamRay(int(c), r);
-                    float2 posA, posB;
-                    if (ProjectToLens(p, 0, LensRay(p, ray, k * stepQ, 1.0), posA) &&
-                        ProjectToLens(p, 1, LensRay(p, ray, k * stepQ, -1.0), posB))
-                    {
-                        const float3 a = SeamSample(src, p, 0, posA);
-                        const float3 b = SeamSample(src, p, 1, posB);
-                        sum += abs((a.r + a.g + a.b) - (b.r + b.g + b.b)) / 3.0;
-                        ++n;
-                    }
-                }
-                costSum[c * DEPTH_STEPS + k] = sum;
-                costCount[c * DEPTH_STEPS + k] = ushort(n);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         const float sigma = DEPTH_SIGMA_DEG * M_PI_F / 180.0;
         for (uint c = tid; c < SEAM_COLUMNS; c += count)
         {
@@ -330,8 +408,9 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
                 const float w = exp(-0.5 * d * d);
                 for (int k = 0; k < DEPTH_STEPS; ++k)
                 {
-                    sum[k] += w * costSum[o * DEPTH_STEPS + k];
-                    n[k] += w * float(costCount[o * DEPTH_STEPS + k]);
+                    const float2 v = p_Costs[o * DEPTH_STEPS + k];
+                    sum[k] += w * v.x;
+                    n[k] += w * v.y;
                 }
             }
             float cost[DEPTH_STEPS];
@@ -349,6 +428,33 @@ kernel void SeamKernel(constant StitchParams& p [[buffer(1)]],
                 shift = curve > 1e-9 ? clamp(0.5 * (cost[best - 1] - cost[best + 1]) / curve, -0.5, 0.5) : 0.0;
             }
             colQ[c] = (float(best) + shift) * stepQ;
+        }
+
+        // Median of each column and its neighbours: a single column that disagrees with the
+        // ones around it is noise, and would bend the seam.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = tid; c < SEAM_COLUMNS; c += count)
+        {
+            float v[MEDIAN_COLUMNS];
+            for (int i = 0; i < MEDIAN_COLUMNS; ++i)
+            {
+                v[i] = colQ[(int(c) + i - MEDIAN_COLUMNS / 2 + SEAM_COLUMNS) % SEAM_COLUMNS];
+            }
+            for (int i = 1; i < MEDIAN_COLUMNS; ++i)
+            {
+                for (int j = i; j > 0 && v[j - 1] > v[j]; --j)
+                {
+                    const float t = v[j];
+                    v[j] = v[j - 1];
+                    v[j - 1] = t;
+                }
+            }
+            colM[c] = v[MEDIAN_COLUMNS / 2];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = tid; c < SEAM_COLUMNS; c += count)
+        {
+            colQ[c] = colM[c];
         }
     }
     else
@@ -639,6 +745,8 @@ struct Pipelines
 {
     id<MTLComputePipelineState> stitch;
     id<MTLComputePipelineState> seam;
+    id<MTLComputePipelineState> seamCost;
+    id<MTLComputePipelineState> check;
     id<MTLComputePipelineState> tag;
     id<MTLComputePipelineState> blur;
     id<MTLTexture> placeholder; // bound in place of the decoded lenses when they are not used
@@ -672,7 +780,9 @@ static Pipelines PipelinesForQueue(id<MTLCommandQueue> p_Queue)
 
     NSError* err = nil;
     id<MTLDevice> device = p_Queue.device;
-    id<MTLLibrary> library = [device newLibraryWithSource:@(kKernelSource) options:[[MTLCompileOptions new] autorelease] error:&err];
+    // The host's table and cost buffer sizes, checked against the shader's own constants.
+    NSString* source = [NSString stringWithFormat:@"#define HOST_SEAM_BINS %d\n#define HOST_SEAM_COSTS %d\n%s", kSeamBins, kSeamCosts, kKernelSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:[[MTLCompileOptions new] autorelease] error:&err];
     if (!library)
     {
         fprintf(stderr, "Insta360Stitch: Metal library failed to build: %s\n", err.localizedDescription.UTF8String);
@@ -680,13 +790,16 @@ static Pipelines PipelinesForQueue(id<MTLCommandQueue> p_Queue)
     }
 
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:1 height:1 mipmapped:NO];
-    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"TagKernel"), BuildPipeline(library, @"BlurKernel"),
+    Pipelines pipelines = {BuildPipeline(library, @"StitchKernel"), BuildPipeline(library, @"SeamKernel"), BuildPipeline(library, @"SeamCostKernel"),
+                           BuildPipeline(library, @"CheckKernel"), BuildPipeline(library, @"TagKernel"), BuildPipeline(library, @"BlurKernel"),
                            [device newTextureWithDescriptor:desc]};
     [library release];
-    if (!pipelines.stitch || !pipelines.seam || !pipelines.tag || !pipelines.blur)
+    if (!pipelines.stitch || !pipelines.seam || !pipelines.seamCost || !pipelines.check || !pipelines.tag || !pipelines.blur)
     {
         [pipelines.stitch release];
         [pipelines.seam release];
+        [pipelines.seamCost release];
+        [pipelines.check release];
         [pipelines.tag release];
         [pipelines.blur release];
         [pipelines.placeholder release];
@@ -769,7 +882,7 @@ bool RunBlurKernel(void* p_CmdQ, int p_Width, int p_Height, bool p_Wrap, float p
 }
 
 bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output, const LensImages* p_Lenses,
-                          std::shared_ptr<FullResCheck> p_Check)
+                          std::shared_ptr<FullResCheck> p_Check, const LensImages* p_Neighbours)
 {
     id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(p_CmdQ);
     const Pipelines pipelines = PipelinesForQueue(queue);
@@ -798,18 +911,33 @@ bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const floa
     [encoder setBuffer:dstBuf offset:0 atIndex:8];
     StitchParams params = p_Params;
     params.fullRes = decoded ? 1 : 0;
+    // Neighbouring frames for the seam analysis: textures 4-7 the frame before, 8-11 the one after.
+    params.seamFrames = 0;
+    for (int f = 0; f < 2 && decoded && p_Neighbours; ++f)
+    {
+        params.seamFrames |= p_Neighbours[f].owner ? 1 << f : 0;
+    }
     [encoder setBytes:&params length:sizeof(StitchParams) atIndex:1];
     for (int i = 0; i < 4; ++i)
     {
         [encoder setTexture:decoded ? static_cast<id<MTLTexture>>(p_Lenses->textures[i]) : pipelines.placeholder atIndex:i];
+        for (int f = 0; f < 2; ++f)
+        {
+            const bool have = (params.seamFrames & (1 << f)) != 0;
+            [encoder setTexture:have ? static_cast<id<MTLTexture>>(p_Neighbours[f].textures[i]) : pipelines.placeholder atIndex:4 + 4 * f + i];
+        }
     }
     if (decoded)
     {
         // The decoded lenses must live until the GPU has read them.
         std::shared_ptr<void> owner = p_Lenses->owner;
+        std::shared_ptr<void> before = params.seamFrames & 1 ? p_Neighbours[0].owner : nullptr;
+        std::shared_ptr<void> after = params.seamFrames & 2 ? p_Neighbours[1].owner : nullptr;
         [tableBuf retain];
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> p_Done) {
             (void)owner;
+            (void)before;
+            (void)after;
             const float* check = static_cast<const float*>(tableBuf.contents) + (kSeamBins + 1) * 4;
             if (p_Check && p_Done.status == MTLCommandBufferStatusCompleted)
             {
@@ -820,8 +948,29 @@ bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const floa
         }];
     }
 
+    // Seam analysis: frame check (full resolution only), the match of every candidate distance,
+    // then the table. The encoder runs the dispatches one after another.
+    id<MTLBuffer> costBuf = nil;
     if (p_Params.mode == eModeStitch || p_Params.mode == eModeReframe)
     {
+        if (decoded)
+        {
+            [encoder setComputePipelineState:pipelines.check];
+            const NSUInteger threads = MIN(pipelines.check.maxTotalThreadsPerThreadgroup, NSUInteger(256));
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        }
+        if (p_Params.autoDistance != 0)
+        {
+            costBuf = [queue.device newBufferWithLength:kSeamCosts * 2 * sizeof(float) options:MTLResourceStorageModePrivate];
+            [encoder setBuffer:costBuf offset:0 atIndex:3];
+            [encoder setComputePipelineState:pipelines.seamCost];
+            const NSUInteger width = pipelines.seamCost.threadExecutionWidth;
+            [encoder dispatchThreadgroups:MTLSizeMake((kSeamCosts + width - 1) / width, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        }
+        else
+        {
+            [encoder setBuffer:tableBuf offset:0 atIndex:3]; // not read
+        }
         [encoder setComputePipelineState:pipelines.seam];
         const NSUInteger threads = MIN(pipelines.seam.maxTotalThreadsPerThreadgroup, NSUInteger(256));
         [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -836,5 +985,6 @@ bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const floa
     [encoder endEncoding];
     [commandBuffer commit];
     [tableBuf release];
+    [costBuf release];
     return true;
 }
