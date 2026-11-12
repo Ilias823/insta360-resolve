@@ -29,11 +29,15 @@ cp "$project/tools/ingest.py" "$project/tools/insv_trailer.py" "$project/tools/i
 # Fail here rather than on the user's Mac if a module is missing: load it the way Resolve will.
 resolve_python="/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython"
 check_python="$( [ -x "$resolve_python" ] && echo "$resolve_python" || command -v python3 )"
-"$check_python" -I -c "import sys; sys.path.insert(0, '$root$support/tools'); import ingest" \
+"$check_python" -I -B -c "import sys; sys.path.insert(0, '$root$support/tools'); import ingest" \
     || { echo "the packaged import tool does not load" >&2; exit 1; }
+find "$root" -name __pycache__ -prune -exec rm -rf {} +
 cp "$here/uninstall.sh" "$root$support/uninstall.sh"
 chmod 755 "$root$support/uninstall.sh"
 sed -e "s|@INGEST@|$support/tools/ingest.py|" "$project/resolve/Insta360 Import.lua" > "$root$scripts_dir/Insta360 Import.lua"
+
+# Compiled files and debug info can record where they were built (/Users/<name>/...).
+if grep -r -a -l -F "$HOME/" "$root" >&2; then echo "the files above contain $HOME; build paths must not ship" >&2; exit 1; fi
 
 # Extended attributes would end up in the package as "._" clutter files.
 xattr -cr "$root"

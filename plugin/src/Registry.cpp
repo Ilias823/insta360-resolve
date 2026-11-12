@@ -41,7 +41,7 @@ std::string JsonString(const std::string& p_Path, const std::string& p_Key)
     {
         return "";
     }
-    // Paths can hold escapes, such as ’ for the apostrophe in "Elias's MacBook".
+    // Paths can hold escapes, such as ’ for the apostrophe in "Sam's MacBook".
     std::string out;
     for (size_t i = pos + 1; i < text.size() && text[i] != '"'; ++i)
     {
