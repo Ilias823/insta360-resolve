@@ -21,7 +21,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from insv_trailer import read_summary
 from stitch_poc import camera_rays, decode, load_calibration, rot_x, rot_y, rot_z, stitch
 
-TEST_BIN = Path(__file__).parent.parent / "plugin/build/test_plugin"
+_PLUGIN = Path(__file__).parent.parent / "plugin"
+TEST_BIN = Path(subprocess.run(["make", "-s", "-C", str(_PLUGIN), "print-build"], capture_output=True,
+                               text=True, check=True).stdout.strip(), "test_plugin")
+TEST_BIN = TEST_BIN if TEST_BIN.is_absolute() else _PLUGIN / TEST_BIN
 MAX_MEAN_DIFF = 0.5   # in 8-bit levels
 MAX_P999_DIFF = 6.0
 

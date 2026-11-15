@@ -36,7 +36,7 @@ To remove it: `sudo "/Library/Application Support/Insta360Stitch/uninstall.sh"`.
 Needs Xcode and DaVinci Resolve (for its OpenFX SDK).
 
 ```sh
-make -C plugin            # build plugin/build/Insta360Stitch.ofx.bundle
+make -C plugin            # build Insta360Stitch.ofx.bundle into plugin/build/ (make -s -C plugin print-build shows where)
 make -C plugin test       # checks that need no host application
 make -C plugin install    # copy to /Library/OFX/Plugins (create it, writable, first)
 tools/install_resolve_menu.sh   # Scripts menu entry using this folder's import tool

@@ -22,7 +22,7 @@ stage="$here/build"
 rm -rf "${stage:?}"
 root="$stage/root"
 mkdir -p "$root/Library/OFX/Plugins" "$root$support/tools" "$root$scripts_dir" "$stage/dist"
-cp -R "$project/plugin/build/Insta360Stitch.ofx.bundle" "$root/Library/OFX/Plugins/"
+cp -R "$(make -s -C "$project/plugin" print-build)/Insta360Stitch.ofx.bundle" "$root/Library/OFX/Plugins/"
 # The import tool and every module it uses (standard library only besides these).
 cp "$project/tools/ingest.py" "$project/tools/insv_trailer.py" "$project/tools/insv_motion.py" \
    "$project/tools/clip_tag.py" "$root$support/tools/"
