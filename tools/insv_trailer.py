@@ -30,7 +30,8 @@ def read_records(path):
         fh.seek(size - 78)
         fmt, rid, rsize = struct.unpack("<BBI", fh.read(6))
         if rid != 0:
-            raise ValueError("index record not found")
+            return {"trailer_size": trailer_size, "version": version,
+                    "records": chained_records(fh, start, size - 72)}
         fh.seek(size - 78 - rsize)
         index = fh.read(rsize)
         records = {}
@@ -42,6 +43,22 @@ def read_records(path):
             records[eid] = {"format": efmt, "size": esize, "offset": eoff,
                             "data": fh.read(esize)}
     return {"trailer_size": trailer_size, "version": version, "records": records}
+
+
+def chained_records(fh, start, end):
+    """Records of a trailer without an index (.insp photos): each one's 6-byte footer gives its
+    size, so they are read from the end backwards."""
+    records = {}
+    while end - 6 > start:
+        fh.seek(end - 6)
+        efmt, eid, esize = struct.unpack("<BBI", fh.read(6))
+        if esize == 0 or end - 6 - esize < start:
+            break
+        fh.seek(end - 6 - esize)
+        records.setdefault(eid, {"format": efmt, "size": esize, "offset": end - 6 - esize - start,
+                                 "data": fh.read(esize)})
+        end -= 6 + esize
+    return records
 
 
 def proto_fields(buf):

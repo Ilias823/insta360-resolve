@@ -6,6 +6,7 @@ Free and open source. If it saves you time, you can support its development on *
 
 ## Features
 
+- **Photos**: `.insp` photos import the same way and become 10-second `<name> 360` clips at full photo resolution, ready to stitch and reframe like video.
 - **Import**: Workspace > Scripts > Insta360 Import turns `.insv` clips into ready-to-edit `<name> 360` clips in an *Insta360* bin (no re-encoding; the lens calibration is read from each file and refined automatically). The lens files they are made from are kept out of the way in *Insta360 > Source files*.
 - **Stitch**: dual-fisheye to equirectangular on the GPU (Metal), with per-frame lens matching and an automatic stitch distance for close subjects.
 - **Reframe**: pan, tilt, roll, field of view and distance, with Insta360 Studio-style looks (Tiny Planet, Mega View, Ultra Wide, Dewarp, Linear). Works in timelines of any shape, including vertical. **Remove Distortion** keeps straight lines straight, like Insta360's linear view.

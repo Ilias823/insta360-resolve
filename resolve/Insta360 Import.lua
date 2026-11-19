@@ -1,4 +1,4 @@
--- Insta360 Import: choose Insta360 X5 .insv clips and prepare them for editing.
+-- Insta360 Import: choose Insta360 X5 .insv clips or .insp photos and prepare them for editing.
 --
 -- For each clip the import tool (tools/ingest.py, run with Resolve's own Python) copies the two
 -- lenses into separate files and reads and refines the lens calibration, showing a progress
@@ -39,7 +39,7 @@ end
 local list = os.getenv("INSTA360_FILES")
 if not list then
     local script = {
-        'set picked to choose file with prompt "Choose Insta360 .insv clips to import" with multiple selections allowed',
+        'set picked to choose file with prompt "Choose Insta360 .insv clips or .insp photos to import" with multiple selections allowed',
         'set out to ""',
         'repeat with f in picked',
         'set out to out & POSIX path of f & linefeed',
@@ -56,12 +56,12 @@ if not list then
 end
 local files = {}
 for path in list:gmatch("[^\n]+") do
-    if path:lower():match("%.insv$") then
+    if path:lower():match("%.insv$") or path:lower():match("%.insp$") then
         table.insert(files, quote(path))
     end
 end
 if #files == 0 then
-    print("Insta360 Import: no .insv files chosen")
+    print("Insta360 Import: no .insv clips or .insp photos chosen")
     return
 end
 

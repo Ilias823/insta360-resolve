@@ -9,6 +9,9 @@
 //   MediaTool still <image> <frames> <rate> <out.mov>
 //                                            a still image (with transparency) as a ProRes 4444 movie of
 //                                            exactly <frames> frames at <rate> (e.g. 30000/1001)
+//   MediaTool photo <photo.insp> <frames> <rate> <lensA> <lensB>
+//                                            each lens of an Insta360 photo as an HEVC movie of
+//                                            <frames> frames; prints "progress <0..1>" lines
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
@@ -201,9 +204,7 @@ static int Frame(NSString* p_Path, double p_Seconds, int p_Size)
     return fwrite(rgb.data(), 1, rgb.size(), stdout) == rgb.size() ? 0 : 1;
 }
 
-// Resolve keeps a still image on a timeline for at most a few seconds, so the clip tag is turned
-// into a movie of exactly the clip's length.
-static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p_Output)
+static CGImageRef ReadImage(NSString* p_Image)
 {
     CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:p_Image], nil);
     CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nil) : nil;
@@ -211,10 +212,16 @@ static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p
     {
         CFRelease(source);
     }
-    if (!image)
-    {
-        return Fail([NSString stringWithFormat:@"cannot read %@", p_Image]);
-    }
+    return image;
+}
+
+// Writes p_Image (released here) as a movie of exactly p_Frames frames at p_Rate.
+// p_Lens: an Insta360 lens picture, as HEVC like the camera's own lens streams; otherwise a
+// picture with transparency, as ProRes 4444.
+static int WriteStillMovie(CGImageRef p_Image, long p_Frames, NSString* p_Rate, NSString* p_Output, bool p_Lens,
+                           void (^p_Progress)(double) = nil)
+{
+    CGImageRef image = p_Image;
     const size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
     NSArray<NSString*>* rate = [p_Rate componentsSeparatedByString:@"/"];
     const int32_t timescale = rate.count == 2 ? rate[0].intValue : int32_t(p_Rate.doubleValue * 1000);
@@ -228,8 +235,19 @@ static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p
     [NSFileManager.defaultManager removeItemAtPath:p_Output error:nil];
     NSError* error = nil;
     AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:p_Output] fileType:AVFileTypeQuickTimeMovie error:&error];
-    AVAssetWriterInput* input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
-        AVVideoCodecKey: AVVideoCodecTypeAppleProRes4444, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height)}];
+    NSDictionary* settings = @{AVVideoCodecKey: AVVideoCodecTypeAppleProRes4444, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height)};
+    if (p_Lens)
+    {
+        // Every frame is the same picture, so after each key frame the rest cost almost nothing.
+        // A key frame every 30 frames and no reordering, like the camera (see LensDecoder.mm).
+        settings = @{AVVideoCodecKey: AVVideoCodecTypeHEVC, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height),
+                     AVVideoColorPropertiesKey: @{AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                                  AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                                  AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2},
+                     AVVideoCompressionPropertiesKey: @{AVVideoQualityKey: @0.95, AVVideoMaxKeyFrameIntervalKey: @30,
+                                                        AVVideoAllowFrameReorderingKey: @NO}};
+    }
+    AVAssetWriterInput* input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:settings];
     AVAssetWriterInputPixelBufferAdaptor* adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
         sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
                                       (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height)}];
@@ -270,6 +288,10 @@ static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p
             CVPixelBufferRelease(pixels);
             return Fail([NSString stringWithFormat:@"writing %@ failed: %@", p_Output, writer.error.localizedDescription]);
         }
+        if (p_Progress)
+        {
+            p_Progress(double(i + 1) / p_Frames);
+        }
     }
     CVPixelBufferRelease(pixels);
     [input markAsFinished];
@@ -280,6 +302,51 @@ static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p
     }];
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     return writer.status == AVAssetWriterStatusCompleted ? 0 : Fail(writer.error.localizedDescription ?: @"writing failed");
+}
+
+// Resolve keeps a still image on a timeline for at most a few seconds, so the clip tag is turned
+// into a movie of exactly the clip's length.
+static int Still(NSString* p_Image, long p_Frames, NSString* p_Rate, NSString* p_Output)
+{
+    CGImageRef image = ReadImage(p_Image);
+    if (!image)
+    {
+        return Fail([NSString stringWithFormat:@"cannot read %@", p_Image]);
+    }
+    return WriteStillMovie(image, p_Frames, p_Rate, p_Output, false);
+}
+
+// An Insta360 photo (.insp) is a JPEG with the two lenses side by side. Each lens becomes a
+// movie like the lens files of a video clip, so a photo is imported and stitched like a clip.
+static int Photo(NSString* p_Photo, long p_Frames, NSString* p_Rate, NSString* p_LensA, NSString* p_LensB)
+{
+    CGImageRef image = ReadImage(p_Photo);
+    if (!image)
+    {
+        return Fail([NSString stringWithFormat:@"cannot read %@", p_Photo]);
+    }
+    const size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    if (width != 2 * height)
+    {
+        CGImageRelease(image);
+        return Fail([NSString stringWithFormat:@"%@ is %zux%zu, not two lenses side by side", p_Photo.lastPathComponent, width, height]);
+    }
+    NSArray<NSString*>* outputs = @[p_LensA, p_LensB];
+    for (size_t i = 0; i < 2; ++i)
+    {
+        CGImageRef lens = CGImageCreateWithImageInRect(image, CGRectMake(i * height, 0, height, height));
+        const int status = lens ? WriteStillMovie(lens, p_Frames, p_Rate, outputs[i], true, ^(double p_Done) {
+            printf("progress %.4f\n", (i + p_Done) / 2.0);
+            fflush(stdout);
+        }) : Fail(@"cannot crop the lenses");
+        if (status != 0)
+        {
+            CGImageRelease(image);
+            return status;
+        }
+    }
+    CGImageRelease(image);
+    return 0;
 }
 
 int main(int argc, const char** argv)
@@ -304,12 +371,16 @@ int main(int argc, const char** argv)
         {
             return Still(@(argv[2]), atol(argv[3]), @(argv[4]), @(argv[5]));
         }
+        if ([command isEqualToString:@"photo"] && argc == 7)
+        {
+            return Photo(@(argv[2]), atol(argv[3]), @(argv[4]), @(argv[5]), @(argv[6]));
+        }
         if ([command isEqualToString:@"frame"] && argc == 5)
         {
             return Frame(@(argv[2]), atof(argv[3]), atoi(argv[4]));
         }
         fprintf(stderr, "usage: MediaTool probe <clip> | split <clip> <out1> <out2> | frame <video> <seconds> <size> | "
-                        "still <image> <frames> <rate> <out.mov>\n");
+                        "still <image> <frames> <rate> <out.mov> | photo <photo.insp> <frames> <rate> <lensA> <lensB>\n");
         return 2;
     }
 }

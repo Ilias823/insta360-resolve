@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare Insta360 X5 .insv clips for DaVinci Resolve.
+"""Prepare Insta360 X5 .insv clips and .insp photos for DaVinci Resolve.
 
 For each clip:
-  1. split the two lens streams into <name>_lensA.mov / <name>_lensB.mov (no re-encode)
+  1. split the two lens streams into <name>_lensA.mov / <name>_lensB.mov (no re-encode);
+     a photo's two lens halves become 10-second movies of that picture
   2. write <name>.json with the lens calibration read from the file's trailer
   3. refine that calibration so the lenses line up at the seam (see tools/refine_seam.py),
      with the SeamRefine helper that ships in the plugin bundle
@@ -38,7 +39,10 @@ BIN_NAME = "Insta360"
 SOURCE_BIN_NAME = "Source files"   # inside BIN_NAME, for the lens files
 # Helper programs inside the plugin bundle: the development build first, then the installed one.
 BUNDLE_RESOURCES = "Insta360Stitch.ofx.bundle/Contents/Resources"
-BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build", Path("/Library/OFX/Plugins")]
+BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build", Path("/Volumes/Code/.derived") / Path(__file__).parent.parent.name,
+               Path("/Library/OFX/Plugins")]   # the second is where plugin/Makefile builds on the author's Mac
+PHOTO_SECONDS = 10        # length of the clip a photo becomes (trim it, or freeze a frame, for longer)
+PHOTO_FPS = 30
 REFINE_FRAMES = 10
 REFINE_SIZE = 1920        # lens image size the helper expects (kWorkSize in plugin/src/SeamRefine.cpp)
 VALUES_PER_LENS = 27
@@ -157,10 +161,36 @@ def run_reporting(cmd, seconds, report):
         raise RuntimeError(f"ffmpeg failed: {err.strip()}")
 
 
+def is_photo(src):
+    return src.suffix.lower() == ".insp"
+
+
+def photo_to_lenses(src, parts, report):
+    """Turns a .insp photo into two lens movies of PHOTO_SECONDS, like the lens files of a clip."""
+    tool = media_tool()
+    if tool is None:
+        raise RuntimeError("photos need the plugin's MediaTool: install the plugin")
+    run_tool_reporting([str(tool), "photo", str(src), str(PHOTO_SECONDS * PHOTO_FPS), str(PHOTO_FPS)]
+                       + [str(f) for f in parts], report)
+
+
 def split(src, out_dir, report=lambda fraction: None):
     """Returns (lensA, lensB, info). Skips work already done."""
-    streams = probe(src)
+    photo = is_photo(src)
     lens_files = [out_dir / f"{src.stem}_lens{c}.mov" for c in "AB"]
+    if photo:
+        parts = [f.with_name(f.stem + ".part.mov") for f in lens_files]
+        if not all(f.exists() and f.stat().st_mtime >= src.stat().st_mtime for f in lens_files):
+            try:
+                photo_to_lenses(src, parts, report)
+                for part, f in zip(parts, lens_files):
+                    part.replace(f)
+            finally:
+                for part in parts:
+                    part.unlink(missing_ok=True)
+        streams = media_probe(lens_files[0])["streams"] + media_probe(lens_files[1])["streams"]
+        return finish_split(src, out_dir, lens_files, streams, photo=True)
+    streams = probe(src)
     done = all(f.exists() and f.stat().st_mtime >= src.stat().st_mtime for f in lens_files)
     # Lens files from before 0.5 have no sound; copy those again.
     if done and media_tool() and media_probe(src).get("audio") and not media_probe(lens_files[0]).get("audio"):
@@ -181,6 +211,11 @@ def split(src, out_dir, report=lambda fraction: None):
         finally:
             for part in parts:
                 part.unlink(missing_ok=True)
+    return finish_split(src, out_dir, lens_files, streams)
+
+
+def finish_split(src, out_dir, lens_files, streams, photo=False):
+    """Calibration, motion, registry entry and tag for lens files made from src."""
     info = read_summary(str(src))
     info.update(source=src.name, width=streams[0]["width"], height=streams[0]["height"],
                 fps=fps_string(streams[0]["r_frame_rate"]), frames=int(streams[0]["nb_frames"]))
@@ -194,11 +229,14 @@ def split(src, out_dir, report=lambda fraction: None):
     except (OSError, ValueError, KeyError):
         pass
     # Camera motion for stabilisation, and the tag that lets the plugin find all of this.
+    # A photo is one moment: nothing to stabilise.
     motion = out_dir / f"{src.stem}.motion"
-    try:
-        data = insv_motion.motion_data(src, info["frames"], float(info["fps"]), info["camera"])
-    except (OSError, ValueError, KeyError, struct.error):
-        data = None
+    data = None
+    if not photo:
+        try:
+            data = insv_motion.motion_data(src, info["frames"], float(info["fps"]), info["camera"])
+        except (OSError, ValueError, KeyError, struct.error):
+            data = None
     if data:
         motion.write_bytes(data)
     info["motion"] = motion.name if data else ""
