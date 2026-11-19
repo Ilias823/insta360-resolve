@@ -442,7 +442,9 @@ def borrow_camera_refinement(path):
 def refine(path, lens_a, lens_b, report=lambda fraction: None):
     """Measures and stores the seam refinement in the clip's .json; returns a short note."""
     info = json.loads(path.read_text())
-    fit = measure_seam(lens_a, lens_b, info.get("calibration_factory", info["calibration_raw"]), report=report)
+    # Every frame of a photo's lens files is the same picture: one is enough.
+    frames = 1 if info.get("source", "").lower().endswith(".insp") else REFINE_FRAMES
+    fit = measure_seam(lens_a, lens_b, info.get("calibration_factory", info["calibration_raw"]), frames, report=report)
     x = [fit["yaw"], fit["pitch"], fit["cx"], fit["cy"]]
     before, after = fit["misalignment_px"]
     applied = apply_refinement(info, x, before, after, fit["frames"])
