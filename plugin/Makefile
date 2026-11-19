@@ -49,7 +49,7 @@ $(BUILD)/SeamRefine: src/SeamRefine.cpp $(BUILD)/Calibration.o src/Calibration.h
 
 # Splits and reads clips for tools/ingest.py with AVFoundation, so importing needs no ffmpeg.
 $(BUILD)/MediaTool: src/MediaTool.mm | $(SDK)
-	$(CXX) src/MediaTool.mm -o $@ $(ARCH) -mmacosx-version-min=13.0 -fobjc-arc -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework CoreVideo -framework ImageIO -framework Foundation
+	$(CXX) src/MediaTool.mm -o $@ $(ARCH) -mmacosx-version-min=13.0 -fobjc-arc -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework CoreVideo -framework ImageIO -framework VideoToolbox -framework Foundation
 
 $(BUILD)/%.o: src/%.cpp src/StitchKernel.h src/Calibration.h src/Tracker.h src/ProgressWindow.h src/ClipTag.h src/Registry.h src/Motion.h src/MotionBlur.h src/LensDecoder.h | $(SDK)
 	$(CXX) -c $< -o $@ $(CXXFLAGS)

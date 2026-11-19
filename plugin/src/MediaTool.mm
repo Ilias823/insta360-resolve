@@ -15,7 +15,9 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
+#import <VideoToolbox/VideoToolbox.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <unistd.h>
 #include <vector>
@@ -215,6 +217,54 @@ static CGImageRef ReadImage(NSString* p_Image)
     return image;
 }
 
+// A key frame every 30 frames and no reordering, like the camera (see LensDecoder.mm).
+static const int kLensKeyFrameInterval = 30;
+
+// p_Count frames of the same picture as HEVC, starting with a key frame: compressed sample
+// buffers in decode order, or an empty array if the encoder failed.
+static NSArray* EncodeLensFrames(CVPixelBufferRef p_Pixels, int p_Count, int64_t p_Duration, int32_t p_Timescale)
+{
+    NSMutableArray* frames = [NSMutableArray array];
+    VTCompressionSessionRef session = nil;
+    if (VTCompressionSessionCreate(nil, int32_t(CVPixelBufferGetWidth(p_Pixels)), int32_t(CVPixelBufferGetHeight(p_Pixels)),
+                                   kCMVideoCodecType_HEVC, nil, nil, nil, nil, nil, &session) != noErr)
+    {
+        return frames;
+    }
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_Quality, (__bridge CFTypeRef)@0.95);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(kLensKeyFrameInterval));
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    bool failed = false;
+    for (int i = 0; i < p_Count && !failed; ++i)
+    {
+        NSDictionary* options = i == 0 ? @{(id)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
+        const OSStatus status = VTCompressionSessionEncodeFrameWithOutputHandler(
+            session, p_Pixels, CMTimeMake(i * p_Duration, p_Timescale), CMTimeMake(p_Duration, p_Timescale),
+            (__bridge CFDictionaryRef)options, nil, ^(OSStatus p_Status, VTEncodeInfoFlags, CMSampleBufferRef p_Sample) {
+                if (p_Status == noErr && p_Sample)
+                {
+                    @synchronized(frames)
+                    {
+                        [frames addObject:(__bridge id)p_Sample];
+                    }
+                }
+            });
+        failed = status != noErr;
+    }
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    if (failed || int(frames.count) != p_Count)
+    {
+        [frames removeAllObjects];
+    }
+    return frames;
+}
+
 // Writes p_Image (released here) as a movie of exactly p_Frames frames at p_Rate.
 // p_Lens: an Insta360 lens picture, as HEVC like the camera's own lens streams; otherwise a
 // picture with transparency, as ProRes 4444.
@@ -232,38 +282,6 @@ static int WriteStillMovie(CGImageRef p_Image, long p_Frames, NSString* p_Rate, 
         return Fail(@"bad frame count or rate");
     }
 
-    [NSFileManager.defaultManager removeItemAtPath:p_Output error:nil];
-    NSError* error = nil;
-    AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:p_Output] fileType:AVFileTypeQuickTimeMovie error:&error];
-    NSDictionary* settings = @{AVVideoCodecKey: AVVideoCodecTypeAppleProRes4444, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height)};
-    if (p_Lens)
-    {
-        // Every frame is the same picture, so after each key frame the rest cost almost nothing.
-        // A key frame every 30 frames and no reordering, like the camera (see LensDecoder.mm).
-        settings = @{AVVideoCodecKey: AVVideoCodecTypeHEVC, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height),
-                     AVVideoColorPropertiesKey: @{AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                                                  AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                                                  AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2},
-                     AVVideoCompressionPropertiesKey: @{AVVideoQualityKey: @0.95, AVVideoMaxKeyFrameIntervalKey: @30,
-                                                        AVVideoAllowFrameReorderingKey: @NO}};
-    }
-    AVAssetWriterInput* input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:settings];
-    AVAssetWriterInputPixelBufferAdaptor* adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
-        sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                                      (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height)}];
-    if (!writer || ![writer canAddInput:input])
-    {
-        CGImageRelease(image);
-        return Fail([NSString stringWithFormat:@"cannot write %@: %@", p_Output, error.localizedDescription]);
-    }
-    // Without this the movie's time scale is 600, which cannot hold 1001/30000 exactly: Resolve would
-    // then see 30 fps instead of 29.97 and skip a frame now and then.
-    input.mediaTimeScale = timescale;
-    writer.movieTimeScale = timescale;
-    [writer addInput:input];
-    [writer startWriting];
-    [writer startSessionAtSourceTime:kCMTimeZero];
-
     CVPixelBufferRef pixels = nil;
     CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &pixels);
     CVPixelBufferLockBaseAddress(pixels, 0);
@@ -277,13 +295,68 @@ static int WriteStillMovie(CGImageRef p_Image, long p_Frames, NSString* p_Rate, 
     CVPixelBufferUnlockBaseAddress(pixels, 0);
     CGImageRelease(image);
 
+    // A lens picture: every frame is the same, so one key-frame interval is encoded and its
+    // compressed frames are written again and again (each interval starts with a key frame, so
+    // the copies decode on their own). Encoding all of them took about 30 s a photo.
+    NSArray* gop = nil;
+    if (p_Lens)
+    {
+        gop = EncodeLensFrames(pixels, int(std::min<long>(p_Frames, kLensKeyFrameInterval)), duration, timescale);
+        if (gop.count == 0)
+        {
+            CVPixelBufferRelease(pixels);
+            return Fail(@"HEVC encoding failed");
+        }
+    }
+
+    [NSFileManager.defaultManager removeItemAtPath:p_Output error:nil];
+    NSError* error = nil;
+    AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:p_Output] fileType:AVFileTypeQuickTimeMovie error:&error];
+    AVAssetWriterInput* input = p_Lens
+        ? [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:nil
+              sourceFormatHint:CMSampleBufferGetFormatDescription((__bridge CMSampleBufferRef)gop[0])]
+        : [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
+              AVVideoCodecKey: AVVideoCodecTypeAppleProRes4444, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height)}];
+    AVAssetWriterInputPixelBufferAdaptor* adaptor = p_Lens ? nil :
+        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
+            sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                                          (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height)}];
+    if (!writer || ![writer canAddInput:input])
+    {
+        CVPixelBufferRelease(pixels);
+        return Fail([NSString stringWithFormat:@"cannot write %@: %@", p_Output, error.localizedDescription]);
+    }
+    // Without this the movie's time scale is 600, which cannot hold 1001/30000 exactly: Resolve would
+    // then see 30 fps instead of 29.97 and skip a frame now and then.
+    input.mediaTimeScale = timescale;
+    writer.movieTimeScale = timescale;
+    [writer addInput:input];
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
     for (long i = 0; i < p_Frames; ++i)
     {
         while (!input.readyForMoreMediaData)
         {
             usleep(1000);
         }
-        if (![adaptor appendPixelBuffer:pixels withPresentationTime:CMTimeMake(i * duration, timescale)])
+        bool appended = false;
+        if (p_Lens)
+        {
+            CMSampleTimingInfo timing = {CMTimeMake(duration, timescale), CMTimeMake(i * duration, timescale), CMTimeMake(i * duration, timescale)};
+            CMSampleBufferRef copy = nil;
+            CMSampleBufferCreateCopyWithNewTiming(nil, (__bridge CMSampleBufferRef)gop[i % gop.count], 1, &timing, &copy);
+            appended = copy && [input appendSampleBuffer:copy];
+            if (copy)
+            {
+                CFRelease(copy);
+            }
+        }
+        else
+        {
+            appended = [adaptor appendPixelBuffer:pixels withPresentationTime:CMTimeMake(i * duration, timescale)];
+        }
+        if (!appended)
         {
             CVPixelBufferRelease(pixels);
             return Fail([NSString stringWithFormat:@"writing %@ failed: %@", p_Output, writer.error.localizedDescription]);
